@@ -14,3 +14,13 @@ Your core observability system that:
   - root cause
   - impact analysis
   - recommended actions
+
+At a high level, LagZero has 5 core layers:
+
+- Data Ingestion
+- Stream Processing (Real-time intelligence)
+- AI Reasoning Layer
+- Incident Engine
+- Action & Integration Layer
+
+<img src="https://drive.google.com/thumbnail?id=1BqdLiqwpZFFe-NKEOisgzpwwF7SBNsCQ">
