@@ -22,5 +22,3 @@ At a high level, LagZero has 5 core layers:
 - AI Reasoning Layer
 - Incident Engine
 - Action & Integration Layer
-
-<img width="1400" height="788" alt="architecture" src="https://github.com/user-attachments/assets/83b3c798-31d0-482c-9d85-2ce4d3e462d8" />
