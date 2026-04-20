@@ -33,6 +33,8 @@ class Settings:
     log_level: str = "INFO"
     lag_spike_multiplier: float = 2.0
     stalled_intervals: int = 2
+    idle_intervals: int = 3
+    rate_window_size: int = 3
     slack_webhook_url: str | None = None
     correlation_window_sec: float = 900.0
 
@@ -58,9 +60,10 @@ class Settings:
                 os.getenv("LAGZERO_LAG_SPIKE_MULTIPLIER"), 2.0
             ),
             stalled_intervals=_parse_optional_int(os.getenv("LAGZERO_STALLED_INTERVALS"), 2),
+            idle_intervals=_parse_optional_int(os.getenv("LAGZERO_IDLE_INTERVALS"), 3),
+            rate_window_size=_parse_optional_int(os.getenv("LAGZERO_RATE_WINDOW_SIZE"), 3),
             slack_webhook_url=os.getenv("LAGZERO_SLACK_WEBHOOK_URL") or None,
             correlation_window_sec=_parse_optional_float(
                 os.getenv("LAGZERO_CORRELATION_WINDOW_SEC"), 900.0
             ),
         )
-

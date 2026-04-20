@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import pstdev
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,3 +48,25 @@ def compute_rate(
         messages_per_second=delta / elapsed_seconds,
     )
 
+
+def smooth_rate(recent_rates: list[float], window_size: int) -> float | None:
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+
+    if not recent_rates:
+        return None
+
+    window = recent_rates[-window_size:]
+    return sum(window) / len(window)
+
+
+def rate_variance_high(recent_rates: list[float], window_size: int) -> bool:
+    window = recent_rates[-window_size:]
+    if len(window) < 2:
+        return False
+
+    average_rate = sum(window) / len(window)
+    if average_rate <= 0:
+        return True
+
+    return (pstdev(window) / average_rate) >= 0.5

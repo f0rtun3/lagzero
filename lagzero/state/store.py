@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 PartitionKey = tuple[str, int]
@@ -13,6 +13,9 @@ class PartitionState:
     observed_at: float
     offset_lag: int
     consecutive_zero_rate_intervals: int = 0
+    consecutive_no_movement_intervals: int = 0
+    recent_rates: list[float] = field(default_factory=list)
+    lag_velocity: float | None = None
 
 
 class InMemoryStateStore:
@@ -24,4 +27,3 @@ class InMemoryStateStore:
 
     def set(self, key: PartitionKey, value: PartitionState) -> None:
         self._state[key] = value
-

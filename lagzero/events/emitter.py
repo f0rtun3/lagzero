@@ -25,10 +25,14 @@ class SlackEventEmitter:
         self._webhook_url = webhook_url
 
     def emit(self, event: IncidentEvent) -> None:
+        if event.scope == "consumer_group":
+            location = f"group `{event.consumer_group}`"
+        else:
+            location = f"`{event.topic}[{event.partition}]` for group `{event.consumer_group}`"
+
         payload = {
             "text": (
-                f"LagZero detected `{event.anomaly or 'normal'}` on "
-                f"`{event.topic}[{event.partition}]` for group `{event.consumer_group}` "
+                f"LagZero detected `{event.anomaly or 'normal'}` on {location} "
                 f"(lag={event.offset_lag}, rate={event.processing_rate}, time_lag_sec={event.time_lag_sec})"
             ),
             "blocks": [
@@ -38,12 +42,14 @@ class SlackEventEmitter:
                         "type": "mrkdwn",
                         "text": (
                             f"*LagZero incident*\n"
-                            f"*Topic/partition:* `{event.topic}[{event.partition}]`\n"
+                            f"*Scope:* `{event.scope}`\n"
+                            f"*Location:* {location}\n"
                             f"*Consumer group:* `{event.consumer_group}`\n"
                             f"*Anomaly:* `{event.anomaly}`\n"
                             f"*Lag:* `{event.offset_lag}`\n"
                             f"*Rate:* `{event.processing_rate}`\n"
-                            f"*Time lag sec:* `{event.time_lag_sec}`"
+                            f"*Time lag sec:* `{event.time_lag_sec}`\n"
+                            f"*Lag velocity:* `{event.lag_velocity}`"
                         ),
                     },
                 }
@@ -58,4 +64,3 @@ class SlackEventEmitter:
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             logger.debug("Slack emitter response status=%s", response.status)
-

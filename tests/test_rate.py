@@ -1,4 +1,4 @@
-from lagzero.monitoring.rate_calculator import compute_rate
+from lagzero.monitoring.rate_calculator import compute_rate, rate_variance_high, smooth_rate
 
 
 def test_compute_rate_returns_none_without_previous_state() -> None:
@@ -35,3 +35,10 @@ def test_compute_rate_marks_state_reset_when_offset_moves_backwards() -> None:
     assert sample.messages_per_second is None
     assert sample.state_reset is True
 
+
+def test_smooth_rate_uses_recent_window_average() -> None:
+    assert smooth_rate([10.0, 20.0, 30.0, 40.0], window_size=3) == 30.0
+
+
+def test_rate_variance_high_detects_bursty_rates() -> None:
+    assert rate_variance_high([1.0, 20.0, 1.0], window_size=3) is True

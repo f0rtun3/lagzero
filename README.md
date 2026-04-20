@@ -12,29 +12,38 @@ Traditional observability tooling tells you that lag is growing. LagZero focuses
 
 The current MVP monitors a Kafka consumer group and emits per-partition incident signals that include:
 
+- Consumer-group incident truth derived from partition state
 - Current offset lag
-- Estimated processing rate
+- Smoothed processing rate
 - Estimated time lag
+- Lag velocity
 - Basic anomaly classification
-- Optional correlation metadata for errors and deploy events
+- Explicit handling for offset resets and idle-but-delayed partitions
+- Optional correlation metadata from external events like deploys
 
 Example output:
 
 ```json
 {
   "timestamp": 1713571200.0,
+  "scope": "partition",
   "topic": "orders",
   "partition": 3,
   "consumer_group": "payments-consumer",
   "offset_lag": 18250,
   "processing_rate": 320.0,
   "time_lag_sec": 57.03,
+  "lag_velocity": 41.2,
   "anomaly": "lag_spike",
   "severity": "warning",
   "confidence": 0.75,
   "correlations": [
     "deploy_within_window"
-  ]
+  ],
+  "diagnostics": {
+    "raw_processing_rate": 400.0,
+    "rate_window_size": 3
+  }
 }
 ```
 
@@ -70,9 +79,11 @@ stdout / Slack
 
 - Kafka-first design with a narrow, useful wedge
 - Continuous polling loop for consumer lag monitoring
-- Sliding rate estimation using previous offsets and timestamps
+- Sliding rate estimation with short-window smoothing
 - Time-lag approximation via `offset_lag / processing_rate`
-- Heuristic anomaly detection for stalled consumers and lag spikes
+- Lag velocity derived from lag deltas over time
+- Group-level incident synthesis with partition diagnostics
+- Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, and offset resets
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
 
@@ -170,6 +181,8 @@ LagZero is configured through environment variables:
 | `LAGZERO_LOG_LEVEL` | Logging level | `INFO` |
 | `LAGZERO_LAG_SPIKE_MULTIPLIER` | Spike threshold vs previous lag | `2.0` |
 | `LAGZERO_STALLED_INTERVALS` | Consecutive zero-rate intervals before stalled | `2` |
+| `LAGZERO_IDLE_INTERVALS` | Consecutive no-movement intervals before idle detection | `3` |
+| `LAGZERO_RATE_WINDOW_SIZE` | Number of intervals used for rate smoothing | `3` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -178,16 +191,38 @@ For each topic partition, the engine:
 
 1. Fetches the latest broker offset and the consumer group committed offset.
 2. Computes offset lag as `high_watermark - committed_offset`.
-3. Estimates processing rate from the previous committed offset and elapsed time.
-4. Estimates time lag as `offset_lag / processing_rate` when rate is positive.
-5. Applies simple heuristics to classify the partition state.
-6. Emits a structured incident event.
+3. Estimates raw processing rate from the previous committed offset and elapsed time.
+4. Smooths rate with a short moving average to reduce burst noise.
+5. Computes time lag as `offset_lag / processing_rate` when rate is positive.
+6. Computes lag velocity from the change in lag over time.
+7. Applies explicit heuristics to classify the partition state.
+8. Synthesizes a consumer-group incident using worst-case partition truth.
+9. Emits structured incident events.
 
 Initial heuristics:
 
 - `consumer_stalled`: no progress for repeated intervals while lag remains positive
+- `idle_but_delayed`: lag persists while offsets stop moving for multiple intervals
 - `lag_spike`: lag jumps sharply relative to the previous observation
+- `offset_reset`: committed offset moved backward, so state was reset intentionally
 - `normal`: no anomaly detected
+
+Confidence is rule-based rather than opaque:
+
+- `0.2` when rate is zero
+- `0.5` when rate variance is high or offsets are not moving
+- `0.9` when rate is stable
+- `0.95` for explicit zero-lag and offset-reset cases
+
+## External Correlation Events
+
+LagZero includes a simple ingestion hook for external operational context:
+
+```python
+engine.add_external_event(event_type="deploy", timestamp=time.time())
+```
+
+This keeps correlation grounded in a defined MVP interface instead of leaving it as a placeholder concept.
 
 ## Slack Output
 
@@ -209,9 +244,10 @@ pytest
 The tests cover the core pure logic:
 
 - lag computation
-- rate estimation
+- rate estimation and smoothing
 - time-lag estimation
 - anomaly detection behavior
+- group event aggregation
 
 ## Design Principles
 
