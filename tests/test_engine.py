@@ -67,9 +67,11 @@ def test_run_once_emits_group_event_and_partition_events() -> None:
     assert events[0].offset_lag == 50
     assert events[0].time_lag_sec == 6.0
     assert events[0].time_lag_source == "timestamp"
+    assert events[0].service_health == "healthy"
     assert events[0].timestamp_type == "create_time"
     assert events[1].scope == "partition"
     assert events[1].time_lag_source == "timestamp"
+    assert events[1].producer_rate is None
     assert events[2].scope == "partition"
 
 
@@ -224,6 +226,7 @@ def test_timestamp_divergence_is_exposed_in_partition_event() -> None:
             observed_at=10.0,
             offset_lag=30,
             recent_rates=[1.0],
+            recent_producer_rates=[1.0],
         ),
     )
 
@@ -232,3 +235,124 @@ def test_timestamp_divergence_is_exposed_in_partition_event() -> None:
 
     assert partition_event.lag_divergence_sec is not None
     assert partition_event.anomaly == "lag_estimation_mismatch"
+
+
+def test_detects_partition_skew_and_group_health() -> None:
+    settings = Settings(
+        bootstrap_servers="localhost:9092",
+        consumer_group="payments",
+        topics=["orders"],
+    )
+    fetcher = FakeOffsetFetcher(
+        snapshots=[
+            PartitionOffsets(
+                topic="orders",
+                partition=0,
+                committed_offset=100,
+                latest_offset=400,
+                observed_at=10.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+            PartitionOffsets(
+                topic="orders",
+                partition=1,
+                committed_offset=100,
+                latest_offset=110,
+                observed_at=10.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+            PartitionOffsets(
+                topic="orders",
+                partition=2,
+                committed_offset=100,
+                latest_offset=115,
+                observed_at=10.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+        ]
+    )
+    emitter = CollectingEmitter()
+    engine = MonitorEngine(settings=settings, offset_fetcher=fetcher, event_emitter=emitter)
+
+    events = engine.run_once()
+
+    assert events[0].scope == "consumer_group"
+    assert events[0].service_health == "degraded"
+    skewed_partition = events[1]
+    assert skewed_partition.anomaly == "partition_skew"
+    assert skewed_partition.diagnostics["partition_skew"] is True
+
+
+def test_detects_system_under_pressure_from_producer_rate() -> None:
+    settings = Settings(
+        bootstrap_servers="localhost:9092",
+        consumer_group="payments",
+        topics=["orders"],
+    )
+    emitter = CollectingEmitter()
+    engine = MonitorEngine(
+        settings=settings,
+        offset_fetcher=FakeOffsetFetcher(
+            snapshots=[
+                PartitionOffsets(
+                    topic="orders",
+                    partition=0,
+                    committed_offset=100,
+                    latest_offset=120,
+                    observed_at=10.0,
+                    timestamp_sampling_state="sampling_failed",
+                ),
+            ]
+        ),
+        event_emitter=emitter,
+    )
+    engine.run_once()
+    engine.offset_fetcher = FakeOffsetFetcher(
+        snapshots=[
+            PartitionOffsets(
+                topic="orders",
+                partition=0,
+                committed_offset=130,
+                latest_offset=200,
+                observed_at=20.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+        ]
+    )
+
+    events = engine.run_once()
+    partition_event = events[1]
+
+    assert partition_event.producer_rate == 8.0
+    assert partition_event.processing_rate == 3.0
+    assert partition_event.backlog_growth_rate == 5.0
+    assert partition_event.anomaly == "system_under_pressure"
+
+
+def test_prunes_old_correlation_events_from_ring_buffer() -> None:
+    settings = Settings(
+        bootstrap_servers="localhost:9092",
+        consumer_group="payments",
+        topics=["orders"],
+        correlation_window_sec=60.0,
+    )
+    fetcher = FakeOffsetFetcher(
+        snapshots=[
+            PartitionOffsets(
+                topic="orders",
+                partition=0,
+                committed_offset=100,
+                latest_offset=120,
+                observed_at=200.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+        ]
+    )
+    emitter = CollectingEmitter()
+    engine = MonitorEngine(settings=settings, offset_fetcher=fetcher, event_emitter=emitter)
+    engine.add_external_event(event_type="deploy", timestamp=100.0)
+    engine.add_external_event(event_type="error", timestamp=180.0)
+
+    events = engine.run_once()
+
+    assert events[0].correlations == ["error"]

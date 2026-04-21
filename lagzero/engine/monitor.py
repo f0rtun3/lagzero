@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from dataclasses import replace
+from statistics import median
 
 from lagzero.config.settings import Settings
 from lagzero.events.emitter import EventEmitter
@@ -31,7 +34,7 @@ class MonitorEngine:
     offset_fetcher: OffsetFetcher
     event_emitter: EventEmitter
     state_store: InMemoryStateStore = field(default_factory=InMemoryStateStore)
-    correlation_signals: list[CorrelationSignal] = field(default_factory=list)
+    correlation_signals: deque[CorrelationSignal] = field(default_factory=deque)
 
     def run_forever(self) -> None:
         logger.info(
@@ -48,6 +51,7 @@ class MonitorEngine:
     def run_once(self) -> list[IncidentEvent]:
         snapshots = self.offset_fetcher.fetch(self.settings.topics)
         partition_events = [self._build_partition_event(snapshot) for snapshot in snapshots]
+        partition_events = self._apply_partition_skew(partition_events)
         events = []
 
         if partition_events:
@@ -75,6 +79,7 @@ class MonitorEngine:
                 attributes=attributes or {},
             )
         )
+        self._prune_correlation_signals(timestamp or time.time())
 
     def _build_partition_event(self, snapshot: PartitionOffsets) -> IncidentEvent:
         key = (snapshot.topic, snapshot.partition)
@@ -96,6 +101,24 @@ class MonitorEngine:
             recent_rates = []
 
         processing_rate = smooth_rate(recent_rates, self.settings.rate_window_size)
+        producer_rate_sample = compute_rate(
+            previous_committed_offset=previous_state.latest_offset if previous_state is not None else None,
+            current_committed_offset=snapshot.latest_offset,
+            previous_timestamp=previous_state.observed_at if previous_state is not None else None,
+            current_timestamp=snapshot.observed_at,
+        )
+        recent_producer_rates = (
+            [] if previous_state is None else list(previous_state.recent_producer_rates)
+        )
+        if producer_rate_sample.messages_per_second is not None:
+            recent_producer_rates.append(producer_rate_sample.messages_per_second)
+        if producer_rate_sample.state_reset:
+            recent_producer_rates = []
+
+        producer_rate = smooth_rate(recent_producer_rates, self.settings.rate_window_size)
+        backlog_growth_rate = None
+        if producer_rate is not None and processing_rate is not None:
+            backlog_growth_rate = producer_rate - processing_rate
         time_lag_estimate = compute_time_lag(
             offset_lag=offset_lag,
             processing_rate=processing_rate,
@@ -157,6 +180,8 @@ class MonitorEngine:
             time_lag_source=time_lag_estimate.source,
             timestamp_type=time_lag_estimate.timestamp_type,
             catching_up=catching_up,
+            producer_rate=producer_rate,
+            backlog_growth_rate=backlog_growth_rate,
         )
 
         correlations = self._collect_correlations(snapshot.observed_at)
@@ -171,6 +196,7 @@ class MonitorEngine:
                 consecutive_zero_rate_intervals=consecutive_zero_rate_intervals,
                 consecutive_no_movement_intervals=consecutive_no_movement_intervals,
                 recent_rates=recent_rates[-self.settings.rate_window_size :],
+                recent_producer_rates=recent_producer_rates[-self.settings.rate_window_size :],
                 lag_velocity=lag_velocity,
                 last_time_lag_sec=time_lag_sec,
             ),
@@ -184,6 +210,8 @@ class MonitorEngine:
             partition=snapshot.partition,
             offset_lag=offset_lag,
             processing_rate=processing_rate,
+            producer_rate=producer_rate,
+            backlog_growth_rate=backlog_growth_rate,
             time_lag_sec=time_lag_sec,
             time_lag_source=time_lag_estimate.source,
             timestamp_type=time_lag_estimate.timestamp_type,
@@ -193,12 +221,15 @@ class MonitorEngine:
             lag_velocity=lag_velocity,
             anomaly=anomaly.name,
             severity=anomaly.severity,
+            service_health=None,
             confidence=anomaly.confidence,
             correlations=correlations,
             diagnostics={
                 "raw_processing_rate": rate_sample.messages_per_second,
+                "raw_producer_rate": producer_rate_sample.messages_per_second,
                 "rate_window_size": self.settings.rate_window_size,
                 "recent_rates": recent_rates[-self.settings.rate_window_size :],
+                "recent_producer_rates": recent_producer_rates[-self.settings.rate_window_size :],
                 "state_reset": rate_sample.state_reset,
                 "no_offset_movement": no_offset_movement,
                 "consecutive_zero_rate_intervals": consecutive_zero_rate_intervals,
@@ -210,6 +241,8 @@ class MonitorEngine:
                 "cold_start": cold_start,
                 "catching_up": catching_up,
                 "lag_decreasing": lag_decreasing,
+                "producer_rate": producer_rate,
+                "backlog_growth_rate": backlog_growth_rate,
                 "lag_divergence_threshold_sec": self.settings.lag_divergence_threshold_sec,
                 "backlog_head_timestamp": snapshot.backlog_head_timestamp,
                 "latest_message_timestamp": snapshot.latest_message_timestamp,
@@ -228,11 +261,20 @@ class MonitorEngine:
         )
         if total_processing_rate == 0:
             total_processing_rate = None
+        total_producer_rate = sum(
+            event.producer_rate for event in partition_events if event.producer_rate is not None
+        )
+        if total_producer_rate == 0:
+            total_producer_rate = None
+        backlog_growth_rate = None
+        if total_producer_rate is not None and total_processing_rate is not None:
+            backlog_growth_rate = total_producer_rate - total_processing_rate
 
         max_lag_velocity = max(
             (event.lag_velocity for event in partition_events if event.lag_velocity is not None),
             default=None,
         )
+        service_health = self._compute_service_health(partition_events)
 
         return IncidentEvent(
             timestamp=max(event.timestamp for event in partition_events),
@@ -242,6 +284,8 @@ class MonitorEngine:
             partition=None,
             offset_lag=total_offset_lag,
             processing_rate=total_processing_rate,
+            producer_rate=total_producer_rate,
+            backlog_growth_rate=backlog_growth_rate,
             time_lag_sec=max_time_lag,
             time_lag_source=worst_event.time_lag_source,
             timestamp_type=worst_event.timestamp_type,
@@ -258,17 +302,28 @@ class MonitorEngine:
             lag_velocity=max_lag_velocity,
             anomaly=worst_event.anomaly,
             severity=worst_event.severity,
+            service_health=service_health,
             confidence=min(event.confidence for event in partition_events),
             correlations=sorted(
                 {correlation for event in partition_events for correlation in event.correlations}
             ),
             diagnostics={
+                "group_time_lag_sec": max_time_lag,
+                "group_anomaly": worst_event.anomaly,
+                "group_severity": worst_event.severity,
+                "service_health": service_health,
                 "partition_count": len(partition_events),
+                "producer_rate": total_producer_rate,
+                "processing_rate": total_processing_rate,
+                "backlog_growth_rate": backlog_growth_rate,
                 "affected_partitions": [
                     {
                         "topic": event.topic,
                         "partition": event.partition,
                         "offset_lag": event.offset_lag,
+                        "producer_rate": event.producer_rate,
+                        "processing_rate": event.processing_rate,
+                        "backlog_growth_rate": event.backlog_growth_rate,
                         "time_lag_sec": event.time_lag_sec,
                         "time_lag_source": event.time_lag_source,
                         "timestamp_type": event.timestamp_type,
@@ -283,17 +338,53 @@ class MonitorEngine:
         )
 
     def _collect_correlations(self, observed_at: float) -> list[str]:
+        self._prune_correlation_signals(observed_at)
         active_signals = []
-        valid_after = observed_at - self.settings.correlation_window_sec
-
-        kept_signals = []
         for signal in self.correlation_signals:
-            if signal.created_at >= valid_after:
-                kept_signals.append(signal)
-                active_signals.append(signal.event_type)
-
-        self.correlation_signals = kept_signals
+            active_signals.append(signal.event_type)
         return sorted(set(active_signals))
+
+    def _prune_correlation_signals(self, observed_at: float) -> None:
+        valid_after = observed_at - self.settings.correlation_window_sec
+        while self.correlation_signals and self.correlation_signals[0].created_at < valid_after:
+            self.correlation_signals.popleft()
+
+    def _apply_partition_skew(self, partition_events: list[IncidentEvent]) -> list[IncidentEvent]:
+        if len(partition_events) < 2:
+            return partition_events
+
+        lag_median = median(event.offset_lag for event in partition_events)
+        if lag_median <= 0:
+            return partition_events
+
+        result: list[IncidentEvent] = []
+        for event in partition_events:
+            if event.offset_lag >= lag_median * 3 and event.offset_lag > 0:
+                result.append(
+                    replace(
+                        event,
+                        anomaly="partition_skew",
+                        severity="warning",
+                        diagnostics={
+                            **event.diagnostics,
+                            "partition_skew": True,
+                            "median_partition_lag": lag_median,
+                        },
+                    )
+                )
+            else:
+                result.append(event)
+        return result
+
+    def _compute_service_health(self, partition_events: list[IncidentEvent]) -> str:
+        worst_event = max(partition_events, key=self._event_rank)
+        if worst_event.anomaly == "catching_up":
+            return "recovering"
+        if worst_event.severity == "critical":
+            return "failing"
+        if worst_event.severity == "warning":
+            return "degraded"
+        return "healthy"
 
     @staticmethod
     def _event_rank(event: IncidentEvent) -> tuple[int, float]:

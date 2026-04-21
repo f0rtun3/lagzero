@@ -12,6 +12,8 @@ class IncidentEvent:
     partition: int | None
     offset_lag: int
     processing_rate: float | None
+    producer_rate: float | None
+    backlog_growth_rate: float | None
     time_lag_sec: float | None
     time_lag_source: str
     timestamp_type: str | None
@@ -21,6 +23,7 @@ class IncidentEvent:
     lag_velocity: float | None
     anomaly: str | None
     severity: str
+    service_health: str | None
     confidence: float
     correlations: list[str] = field(default_factory=list)
     diagnostics: dict[str, object] = field(default_factory=dict)

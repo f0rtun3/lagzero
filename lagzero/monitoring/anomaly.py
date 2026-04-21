@@ -29,6 +29,8 @@ def detect_anomaly(
     time_lag_source: str,
     timestamp_type: str | None,
     catching_up: bool,
+    producer_rate: float | None,
+    backlog_growth_rate: float | None,
 ) -> AnomalyResult:
     confidence = _compute_confidence(
         processing_rate=processing_rate,
@@ -49,6 +51,15 @@ def detect_anomaly(
 
     if catching_up:
         return AnomalyResult(name="catching_up", severity="info", confidence=confidence)
+
+    if (
+        producer_rate is not None
+        and processing_rate is not None
+        and backlog_growth_rate is not None
+        and producer_rate > processing_rate
+        and backlog_growth_rate > 0
+    ):
+        return AnomalyResult(name="system_under_pressure", severity="warning", confidence=confidence)
 
     if (
         lag_divergence_sec is not None

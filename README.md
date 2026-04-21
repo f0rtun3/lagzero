@@ -15,11 +15,13 @@ The current MVP monitors a Kafka consumer group and emits per-partition incident
 - Consumer-group incident truth derived from partition state
 - Current offset lag
 - Smoothed processing rate
+- Producer rate and backlog growth rate
 - Estimated time lag with timestamp-based correction
 - Explicit timestamp semantics and lag divergence diagnostics
+- Service-health classification for the consumer group
 - Lag velocity
 - Basic anomaly classification
-- Explicit handling for offset resets and idle-but-delayed partitions
+- Explicit handling for offset resets, cold-start catch-up, and partition skew
 - Optional correlation metadata from external events like deploys
 
 Example output:
@@ -33,6 +35,8 @@ Example output:
   "consumer_group": "payments-consumer",
   "offset_lag": 18250,
   "processing_rate": 320.0,
+  "producer_rate": 410.0,
+  "backlog_growth_rate": 90.0,
   "time_lag_sec": 92.0,
   "time_lag_source": "timestamp",
   "timestamp_type": "create_time",
@@ -40,14 +44,16 @@ Example output:
   "latest_message_timestamp": 1713571195.0,
   "lag_divergence_sec": 34.97,
   "lag_velocity": 41.2,
-  "anomaly": "lag_spike",
+  "anomaly": "system_under_pressure",
   "severity": "warning",
+  "service_health": null,
   "confidence": 0.75,
   "correlations": [
     "deploy_within_window"
   ],
   "diagnostics": {
     "raw_processing_rate": 400.0,
+    "raw_producer_rate": 450.0,
     "rate_window_size": 3,
     "offset_time_lag_sec": 57.03,
     "timestamp_time_lag_sec": 92.0
@@ -88,11 +94,16 @@ stdout / Slack
 - Kafka-first design with a narrow, useful wedge
 - Continuous polling loop for consumer lag monitoring
 - Sliding rate estimation with short-window smoothing
+- Producer-rate estimation from broker offset movement
 - Hybrid time-lag estimation using `offset_lag / processing_rate` plus timestamp correction
 - Timestamp sampling cache to avoid per-partition fetch cost on every poll
+- Backlog growth and system-pressure detection
 - Lag velocity derived from lag deltas over time
 - Group-level incident synthesis with partition diagnostics
-- Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, estimation mismatch, cold-start catch-up, and offset resets
+- Partition-skew detection for Kafka hotspots
+- Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, estimation mismatch, cold-start catch-up, pressure, and offset resets
+- Explicit consumer-group service health: `healthy`, `degraded`, `failing`, `recovering`
+- In-memory correlation window for recent operational events
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
 
@@ -202,14 +213,17 @@ For each topic partition, the engine:
 
 1. Fetches the latest broker offset and the consumer group committed offset.
 2. Computes offset lag as `high_watermark - committed_offset`.
-3. Estimates raw processing rate from the previous committed offset and elapsed time.
-4. Smooths rate with a short moving average to reduce burst noise.
-5. Estimates offset-based lag as `offset_lag / processing_rate` when rate is positive.
-6. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
-7. Computes lag velocity from the change in lag over time.
-8. Applies explicit heuristics to classify the partition state.
-9. Synthesizes a consumer-group incident using worst-case partition truth.
-10. Emits structured incident events.
+3. Estimates consumer processing rate from committed offset movement.
+4. Estimates producer rate from latest broker offset movement.
+5. Smooths both rates with a short moving average to reduce burst noise.
+6. Derives backlog growth rate as `producer_rate - processing_rate`.
+7. Estimates offset-based lag as `offset_lag / processing_rate` when rate is positive.
+8. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
+9. Computes lag velocity from the change in lag over time.
+10. Applies explicit heuristics to classify the partition state.
+11. Detects partition skew from cross-partition lag imbalance.
+12. Synthesizes a consumer-group incident using worst-case partition truth and explicit service-health rules.
+13. Emits structured incident events.
 
 Timestamp correction works like this:
 
@@ -225,9 +239,18 @@ Initial heuristics:
 - `idle_but_delayed`: lag persists while offsets stop moving for multiple intervals
 - `lag_spike`: lag jumps sharply relative to the previous observation
 - `lag_estimation_mismatch`: measured timestamp lag and estimated lag diverge materially
+- `system_under_pressure`: producer rate exceeds consumer rate and backlog is growing
+- `partition_skew`: one partition is disproportionately behind the rest
 - `offset_reset`: committed offset moved backward, so state was reset intentionally
 - `catching_up`: consumer is cold-starting and reducing lag at a healthy rate
 - `normal`: no anomaly detected
+
+Consumer-group service health is derived explicitly:
+
+- `healthy`: no meaningful incident signal at the group level
+- `degraded`: warning-level anomalies such as pressure, spike, skew, or divergence
+- `failing`: critical partition behavior such as a stalled consumer
+- `recovering`: the group is catching up after a cold start
 
 Confidence is rule-based rather than opaque:
 
@@ -247,7 +270,7 @@ LagZero includes a simple ingestion hook for external operational context:
 engine.add_external_event(event_type="deploy", timestamp=time.time())
 ```
 
-This keeps correlation grounded in a defined MVP interface instead of leaving it as a placeholder concept.
+Recent external events are retained in an in-memory time window and attached to emitted incidents as correlation context. This keeps correlation grounded in a defined MVP interface instead of leaving it as a placeholder concept.
 
 ## Slack Output
 
@@ -272,7 +295,8 @@ The tests cover the core pure logic:
 - rate estimation and smoothing
 - time-lag estimation and timestamp correction
 - anomaly detection behavior
-- group event aggregation
+- group event aggregation and service health
+- producer pressure, partition skew, and correlation retention
 
 ## Design Principles
 
