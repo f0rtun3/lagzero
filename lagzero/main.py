@@ -46,6 +46,7 @@ def main() -> int:
         fetcher = KafkaOffsetFetcher(
             bootstrap_servers=settings.bootstrap_servers,
             consumer_group=settings.consumer_group,
+            timestamp_sample_interval_sec=settings.timestamp_sample_interval_sec,
         )
     except Exception as exc:
         print(f"Failed to initialize LagZero: {exc}", file=sys.stderr)

@@ -16,6 +16,7 @@ The current MVP monitors a Kafka consumer group and emits per-partition incident
 - Current offset lag
 - Smoothed processing rate
 - Estimated time lag with timestamp-based correction
+- Explicit timestamp semantics and lag divergence diagnostics
 - Lag velocity
 - Basic anomaly classification
 - Explicit handling for offset resets and idle-but-delayed partitions
@@ -34,6 +35,10 @@ Example output:
   "processing_rate": 320.0,
   "time_lag_sec": 92.0,
   "time_lag_source": "timestamp",
+  "timestamp_type": "create_time",
+  "backlog_head_timestamp": 1713571108.0,
+  "latest_message_timestamp": 1713571195.0,
+  "lag_divergence_sec": 34.97,
   "lag_velocity": 41.2,
   "anomaly": "lag_spike",
   "severity": "warning",
@@ -84,9 +89,10 @@ stdout / Slack
 - Continuous polling loop for consumer lag monitoring
 - Sliding rate estimation with short-window smoothing
 - Hybrid time-lag estimation using `offset_lag / processing_rate` plus timestamp correction
+- Timestamp sampling cache to avoid per-partition fetch cost on every poll
 - Lag velocity derived from lag deltas over time
 - Group-level incident synthesis with partition diagnostics
-- Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, and offset resets
+- Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, estimation mismatch, cold-start catch-up, and offset resets
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
 
@@ -186,6 +192,8 @@ LagZero is configured through environment variables:
 | `LAGZERO_STALLED_INTERVALS` | Consecutive zero-rate intervals before stalled | `2` |
 | `LAGZERO_IDLE_INTERVALS` | Consecutive no-movement intervals before idle detection | `3` |
 | `LAGZERO_RATE_WINDOW_SIZE` | Number of intervals used for rate smoothing | `3` |
+| `LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC` | Minimum interval between timestamp sampling attempts per partition | `30` |
+| `LAGZERO_LAG_DIVERGENCE_THRESHOLD_SEC` | Threshold for flagging measured vs estimated lag mismatch | `120` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -206,22 +214,29 @@ For each topic partition, the engine:
 Timestamp correction works like this:
 
 - If the oldest unprocessed message timestamp is available, `time_lag_sec` becomes `observed_at - backlog_head_timestamp`
-- If Kafka timestamps are unavailable, LagZero falls back to the offset/rate estimate
-- Both values are preserved in event diagnostics so operators can compare them
+- If Kafka timestamps are unavailable, sparse-partition sampling fails, or the consumer is cold-starting, LagZero falls back to the offset/rate estimate
+- Sampling is throttled with `LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC` so timestamp measurement is cheaper than the main poll loop
+- Timestamp semantics are preserved with `timestamp_type` so `create_time` and `log_append_time` remain distinguishable
+- Both values are preserved, together with `lag_divergence_sec`, so operators can compare measured delay vs estimated delay
 
 Initial heuristics:
 
 - `consumer_stalled`: no progress for repeated intervals while lag remains positive
 - `idle_but_delayed`: lag persists while offsets stop moving for multiple intervals
 - `lag_spike`: lag jumps sharply relative to the previous observation
+- `lag_estimation_mismatch`: measured timestamp lag and estimated lag diverge materially
 - `offset_reset`: committed offset moved backward, so state was reset intentionally
+- `catching_up`: consumer is cold-starting and reducing lag at a healthy rate
 - `normal`: no anomaly detected
 
 Confidence is rule-based rather than opaque:
 
 - `0.2` when rate is zero
-- `0.5` when rate variance is high or offsets are not moving
-- `0.9` when rate is stable
+- `0.5` when rate variance is high, offsets are not moving, or measured and estimated lag diverge
+- `0.9` for timestamp lag derived from `log_append_time`
+- `0.75` for timestamp lag derived from `create_time`
+- `0.6` for estimated lag
+- `0.4` for fallback estimation after sparse-partition sampling failure or cold start
 - `0.95` for explicit zero-lag and offset-reset cases
 
 ## External Correlation Events

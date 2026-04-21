@@ -101,6 +101,9 @@ class MonitorEngine:
             processing_rate=processing_rate,
             observed_at=snapshot.observed_at,
             backlog_head_timestamp=snapshot.backlog_head_timestamp,
+            timestamp_sampling_state=snapshot.timestamp_sampling_state,
+            timestamp_type=snapshot.timestamp_type,
+            lag_divergence_threshold_sec=self.settings.lag_divergence_threshold_sec,
         )
         time_lag_sec = time_lag_estimate.seconds
         lag_velocity = compute_lag_velocity(
@@ -112,6 +115,16 @@ class MonitorEngine:
             previous_state is not None
             and snapshot.committed_offset == previous_state.committed_offset
             and snapshot.latest_offset == previous_state.latest_offset
+        )
+        lag_decreasing = previous_state is not None and offset_lag < previous_state.offset_lag
+        cold_start = snapshot.committed_offset == 0 or (
+            previous_state is not None and previous_state.committed_offset == 0
+        )
+        catching_up = (
+            cold_start
+            and processing_rate is not None
+            and processing_rate > 0
+            and lag_decreasing
         )
 
         consecutive_zero_rate_intervals = 0
@@ -139,6 +152,11 @@ class MonitorEngine:
             lag_velocity=lag_velocity,
             no_offset_movement=no_offset_movement,
             state_reset=rate_sample.state_reset,
+            lag_divergence_sec=time_lag_estimate.lag_divergence_sec,
+            lag_divergence_threshold_sec=self.settings.lag_divergence_threshold_sec,
+            time_lag_source=time_lag_estimate.source,
+            timestamp_type=time_lag_estimate.timestamp_type,
+            catching_up=catching_up,
         )
 
         correlations = self._collect_correlations(snapshot.observed_at)
@@ -154,6 +172,7 @@ class MonitorEngine:
                 consecutive_no_movement_intervals=consecutive_no_movement_intervals,
                 recent_rates=recent_rates[-self.settings.rate_window_size :],
                 lag_velocity=lag_velocity,
+                last_time_lag_sec=time_lag_sec,
             ),
         )
 
@@ -167,6 +186,10 @@ class MonitorEngine:
             processing_rate=processing_rate,
             time_lag_sec=time_lag_sec,
             time_lag_source=time_lag_estimate.source,
+            timestamp_type=time_lag_estimate.timestamp_type,
+            backlog_head_timestamp=snapshot.backlog_head_timestamp,
+            latest_message_timestamp=snapshot.latest_message_timestamp,
+            lag_divergence_sec=time_lag_estimate.lag_divergence_sec,
             lag_velocity=lag_velocity,
             anomaly=anomaly.name,
             severity=anomaly.severity,
@@ -182,6 +205,12 @@ class MonitorEngine:
                 "consecutive_no_movement_intervals": consecutive_no_movement_intervals,
                 "offset_time_lag_sec": time_lag_estimate.offset_based_seconds,
                 "timestamp_time_lag_sec": time_lag_estimate.timestamp_based_seconds,
+                "timestamp_sampling_state": snapshot.timestamp_sampling_state,
+                "timestamp_sampled_at": snapshot.timestamp_sampled_at,
+                "cold_start": cold_start,
+                "catching_up": catching_up,
+                "lag_decreasing": lag_decreasing,
+                "lag_divergence_threshold_sec": self.settings.lag_divergence_threshold_sec,
                 "backlog_head_timestamp": snapshot.backlog_head_timestamp,
                 "latest_message_timestamp": snapshot.latest_message_timestamp,
             },
@@ -214,11 +243,18 @@ class MonitorEngine:
             offset_lag=total_offset_lag,
             processing_rate=total_processing_rate,
             time_lag_sec=max_time_lag,
-            time_lag_source="timestamp"
-            if any(event.time_lag_source == "timestamp" for event in partition_events)
-            else "offset_rate"
-            if any(event.time_lag_source == "offset_rate" for event in partition_events)
-            else "unavailable",
+            time_lag_source=worst_event.time_lag_source,
+            timestamp_type=worst_event.timestamp_type,
+            backlog_head_timestamp=worst_event.backlog_head_timestamp,
+            latest_message_timestamp=worst_event.latest_message_timestamp,
+            lag_divergence_sec=max(
+                (
+                    event.lag_divergence_sec
+                    for event in partition_events
+                    if event.lag_divergence_sec is not None
+                ),
+                default=None,
+            ),
             lag_velocity=max_lag_velocity,
             anomaly=worst_event.anomaly,
             severity=worst_event.severity,
@@ -235,6 +271,8 @@ class MonitorEngine:
                         "offset_lag": event.offset_lag,
                         "time_lag_sec": event.time_lag_sec,
                         "time_lag_source": event.time_lag_source,
+                        "timestamp_type": event.timestamp_type,
+                        "lag_divergence_sec": event.lag_divergence_sec,
                         "lag_velocity": event.lag_velocity,
                         "anomaly": event.anomaly,
                         "severity": event.severity,

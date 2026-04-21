@@ -14,6 +14,10 @@ class IncidentEvent:
     processing_rate: float | None
     time_lag_sec: float | None
     time_lag_source: str
+    timestamp_type: str | None
+    backlog_head_timestamp: float | None
+    latest_message_timestamp: float | None
+    lag_divergence_sec: float | None
     lag_velocity: float | None
     anomaly: str | None
     severity: str

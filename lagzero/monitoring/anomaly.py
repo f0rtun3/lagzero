@@ -24,12 +24,21 @@ def detect_anomaly(
     lag_velocity: float | None,
     no_offset_movement: bool,
     state_reset: bool,
+    lag_divergence_sec: float | None,
+    lag_divergence_threshold_sec: float,
+    time_lag_source: str,
+    timestamp_type: str | None,
+    catching_up: bool,
 ) -> AnomalyResult:
     confidence = _compute_confidence(
         processing_rate=processing_rate,
         rate_variance_high=rate_variance_high,
         no_offset_movement=no_offset_movement,
         state_reset=state_reset,
+        lag_divergence_sec=lag_divergence_sec,
+        lag_divergence_threshold_sec=lag_divergence_threshold_sec,
+        time_lag_source=time_lag_source,
+        timestamp_type=timestamp_type,
     )
 
     if state_reset:
@@ -37,6 +46,19 @@ def detect_anomaly(
 
     if current_lag <= 0:
         return AnomalyResult(name="normal", severity="info", confidence=0.95)
+
+    if catching_up:
+        return AnomalyResult(name="catching_up", severity="info", confidence=confidence)
+
+    if (
+        lag_divergence_sec is not None
+        and lag_divergence_sec >= lag_divergence_threshold_sec
+    ):
+        return AnomalyResult(
+            name="lag_estimation_mismatch",
+            severity="warning",
+            confidence=confidence,
+        )
 
     if (
         no_offset_movement
@@ -74,13 +96,32 @@ def _compute_confidence(
     rate_variance_high: bool,
     no_offset_movement: bool,
     state_reset: bool,
+    lag_divergence_sec: float | None,
+    lag_divergence_threshold_sec: float,
+    time_lag_source: str,
+    timestamp_type: str | None,
 ) -> float:
     if state_reset:
         return 0.95
+    if time_lag_source == "timestamp":
+        base_confidence = 0.9 if timestamp_type == "log_append_time" else 0.75
+    elif time_lag_source == "estimated":
+        base_confidence = 0.6
+    elif time_lag_source == "estimated_fallback":
+        base_confidence = 0.4
+    else:
+        base_confidence = 0.3
     if processing_rate == 0:
-        return 0.2
+        return min(base_confidence, 0.2)
     if processing_rate is None:
-        return 0.4
-    if rate_variance_high or no_offset_movement:
-        return 0.5
-    return 0.9
+        return min(base_confidence, 0.4)
+    if (
+        rate_variance_high
+        or no_offset_movement
+        or (
+            lag_divergence_sec is not None
+            and lag_divergence_sec >= lag_divergence_threshold_sec
+        )
+    ):
+        return min(base_confidence, 0.5)
+    return base_confidence

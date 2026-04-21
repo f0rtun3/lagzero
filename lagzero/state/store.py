@@ -16,6 +16,7 @@ class PartitionState:
     consecutive_no_movement_intervals: int = 0
     recent_rates: list[float] = field(default_factory=list)
     lag_velocity: float | None = None
+    last_time_lag_sec: float | None = None
 
 
 class InMemoryStateStore:

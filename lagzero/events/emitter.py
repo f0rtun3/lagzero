@@ -50,6 +50,8 @@ class SlackEventEmitter:
                             f"*Rate:* `{event.processing_rate}`\n"
                             f"*Time lag sec:* `{event.time_lag_sec}`\n"
                             f"*Time lag source:* `{event.time_lag_source}`\n"
+                            f"*Timestamp type:* `{event.timestamp_type}`\n"
+                            f"*Lag divergence sec:* `{event.lag_divergence_sec}`\n"
                             f"*Lag velocity:* `{event.lag_velocity}`"
                         ),
                     },
