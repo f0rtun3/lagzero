@@ -33,7 +33,7 @@ class SlackEventEmitter:
         payload = {
             "text": (
                 f"LagZero detected `{event.anomaly or 'normal'}` on {location} "
-                f"(lag={event.offset_lag}, rate={event.processing_rate}, time_lag_sec={event.time_lag_sec})"
+                f"(lag={event.offset_lag}, rate={event.processing_rate}, time_lag_sec={event.time_lag_sec}, source={event.time_lag_source})"
             ),
             "blocks": [
                 {
@@ -49,6 +49,7 @@ class SlackEventEmitter:
                             f"*Lag:* `{event.offset_lag}`\n"
                             f"*Rate:* `{event.processing_rate}`\n"
                             f"*Time lag sec:* `{event.time_lag_sec}`\n"
+                            f"*Time lag source:* `{event.time_lag_source}`\n"
                             f"*Lag velocity:* `{event.lag_velocity}`"
                         ),
                     },

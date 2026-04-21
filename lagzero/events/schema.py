@@ -13,6 +13,7 @@ class IncidentEvent:
     offset_lag: int
     processing_rate: float | None
     time_lag_sec: float | None
+    time_lag_source: str
     lag_velocity: float | None
     anomaly: str | None
     severity: str

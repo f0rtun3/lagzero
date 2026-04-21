@@ -96,7 +96,13 @@ class MonitorEngine:
             recent_rates = []
 
         processing_rate = smooth_rate(recent_rates, self.settings.rate_window_size)
-        time_lag_sec = compute_time_lag(offset_lag=offset_lag, processing_rate=processing_rate)
+        time_lag_estimate = compute_time_lag(
+            offset_lag=offset_lag,
+            processing_rate=processing_rate,
+            observed_at=snapshot.observed_at,
+            backlog_head_timestamp=snapshot.backlog_head_timestamp,
+        )
+        time_lag_sec = time_lag_estimate.seconds
         lag_velocity = compute_lag_velocity(
             previous_lag=previous_state.offset_lag if previous_state is not None else None,
             current_lag=offset_lag,
@@ -160,6 +166,7 @@ class MonitorEngine:
             offset_lag=offset_lag,
             processing_rate=processing_rate,
             time_lag_sec=time_lag_sec,
+            time_lag_source=time_lag_estimate.source,
             lag_velocity=lag_velocity,
             anomaly=anomaly.name,
             severity=anomaly.severity,
@@ -173,6 +180,10 @@ class MonitorEngine:
                 "no_offset_movement": no_offset_movement,
                 "consecutive_zero_rate_intervals": consecutive_zero_rate_intervals,
                 "consecutive_no_movement_intervals": consecutive_no_movement_intervals,
+                "offset_time_lag_sec": time_lag_estimate.offset_based_seconds,
+                "timestamp_time_lag_sec": time_lag_estimate.timestamp_based_seconds,
+                "backlog_head_timestamp": snapshot.backlog_head_timestamp,
+                "latest_message_timestamp": snapshot.latest_message_timestamp,
             },
         )
 
@@ -203,6 +214,11 @@ class MonitorEngine:
             offset_lag=total_offset_lag,
             processing_rate=total_processing_rate,
             time_lag_sec=max_time_lag,
+            time_lag_source="timestamp"
+            if any(event.time_lag_source == "timestamp" for event in partition_events)
+            else "offset_rate"
+            if any(event.time_lag_source == "offset_rate" for event in partition_events)
+            else "unavailable",
             lag_velocity=max_lag_velocity,
             anomaly=worst_event.anomaly,
             severity=worst_event.severity,
@@ -218,6 +234,7 @@ class MonitorEngine:
                         "partition": event.partition,
                         "offset_lag": event.offset_lag,
                         "time_lag_sec": event.time_lag_sec,
+                        "time_lag_source": event.time_lag_source,
                         "lag_velocity": event.lag_velocity,
                         "anomaly": event.anomaly,
                         "severity": event.severity,

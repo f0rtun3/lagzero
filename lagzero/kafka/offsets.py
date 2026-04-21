@@ -15,6 +15,8 @@ class PartitionOffsets:
     committed_offset: int
     latest_offset: int
     observed_at: float
+    backlog_head_timestamp: float | None = None
+    latest_message_timestamp: float | None = None
 
 
 class OffsetFetcher(Protocol):
@@ -48,17 +50,64 @@ class KafkaOffsetFetcher:
 
             for topic_partition in topic_partitions:
                 committed_offset = self._consumer.committed(topic_partition)
+                normalized_committed_offset = committed_offset if committed_offset is not None else 0
+                latest_offset = latest_offsets.get(topic_partition, 0)
                 offsets.append(
                     PartitionOffsets(
                         topic=topic_partition.topic,
                         partition=topic_partition.partition,
-                        committed_offset=committed_offset if committed_offset is not None else 0,
-                        latest_offset=latest_offsets.get(topic_partition, 0),
+                        committed_offset=normalized_committed_offset,
+                        latest_offset=latest_offset,
                         observed_at=observed_at,
+                        backlog_head_timestamp=self._fetch_backlog_head_timestamp(
+                            topic_partition=topic_partition,
+                            committed_offset=normalized_committed_offset,
+                            latest_offset=latest_offset,
+                        ),
+                        latest_message_timestamp=self._fetch_latest_message_timestamp(
+                            topic_partition=topic_partition,
+                            latest_offset=latest_offset,
+                        ),
                     )
                 )
 
         return offsets
+
+    def _fetch_backlog_head_timestamp(
+        self,
+        *,
+        topic_partition: object,
+        committed_offset: int,
+        latest_offset: int,
+    ) -> float | None:
+        if latest_offset <= committed_offset:
+            return None
+        return self._read_message_timestamp(topic_partition=topic_partition, offset=committed_offset)
+
+    def _fetch_latest_message_timestamp(
+        self,
+        *,
+        topic_partition: object,
+        latest_offset: int,
+    ) -> float | None:
+        if latest_offset <= 0:
+            return None
+        return self._read_message_timestamp(topic_partition=topic_partition, offset=latest_offset - 1)
+
+    def _read_message_timestamp(self, *, topic_partition: object, offset: int) -> float | None:
+        self._consumer.assign([topic_partition])
+        self._consumer.seek(topic_partition, offset)
+        records = self._consumer.poll(timeout_ms=500, max_records=1)
+        messages = records.get(topic_partition, [])
+        if not messages:
+            return None
+
+        message = messages[0]
+        timestamp_ms = getattr(message, "timestamp", None)
+        if timestamp_ms is None or timestamp_ms < 0:
+            return None
+
+        return timestamp_ms / 1000.0
 
     def close(self) -> None:
         self._consumer.close()

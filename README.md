@@ -15,7 +15,7 @@ The current MVP monitors a Kafka consumer group and emits per-partition incident
 - Consumer-group incident truth derived from partition state
 - Current offset lag
 - Smoothed processing rate
-- Estimated time lag
+- Estimated time lag with timestamp-based correction
 - Lag velocity
 - Basic anomaly classification
 - Explicit handling for offset resets and idle-but-delayed partitions
@@ -32,7 +32,8 @@ Example output:
   "consumer_group": "payments-consumer",
   "offset_lag": 18250,
   "processing_rate": 320.0,
-  "time_lag_sec": 57.03,
+  "time_lag_sec": 92.0,
+  "time_lag_source": "timestamp",
   "lag_velocity": 41.2,
   "anomaly": "lag_spike",
   "severity": "warning",
@@ -42,7 +43,9 @@ Example output:
   ],
   "diagnostics": {
     "raw_processing_rate": 400.0,
-    "rate_window_size": 3
+    "rate_window_size": 3,
+    "offset_time_lag_sec": 57.03,
+    "timestamp_time_lag_sec": 92.0
   }
 }
 ```
@@ -80,7 +83,7 @@ stdout / Slack
 - Kafka-first design with a narrow, useful wedge
 - Continuous polling loop for consumer lag monitoring
 - Sliding rate estimation with short-window smoothing
-- Time-lag approximation via `offset_lag / processing_rate`
+- Hybrid time-lag estimation using `offset_lag / processing_rate` plus timestamp correction
 - Lag velocity derived from lag deltas over time
 - Group-level incident synthesis with partition diagnostics
 - Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, and offset resets
@@ -193,11 +196,18 @@ For each topic partition, the engine:
 2. Computes offset lag as `high_watermark - committed_offset`.
 3. Estimates raw processing rate from the previous committed offset and elapsed time.
 4. Smooths rate with a short moving average to reduce burst noise.
-5. Computes time lag as `offset_lag / processing_rate` when rate is positive.
-6. Computes lag velocity from the change in lag over time.
-7. Applies explicit heuristics to classify the partition state.
-8. Synthesizes a consumer-group incident using worst-case partition truth.
-9. Emits structured incident events.
+5. Estimates offset-based lag as `offset_lag / processing_rate` when rate is positive.
+6. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
+7. Computes lag velocity from the change in lag over time.
+8. Applies explicit heuristics to classify the partition state.
+9. Synthesizes a consumer-group incident using worst-case partition truth.
+10. Emits structured incident events.
+
+Timestamp correction works like this:
+
+- If the oldest unprocessed message timestamp is available, `time_lag_sec` becomes `observed_at - backlog_head_timestamp`
+- If Kafka timestamps are unavailable, LagZero falls back to the offset/rate estimate
+- Both values are preserved in event diagnostics so operators can compare them
 
 Initial heuristics:
 
@@ -245,7 +255,7 @@ The tests cover the core pure logic:
 
 - lag computation
 - rate estimation and smoothing
-- time-lag estimation
+- time-lag estimation and timestamp correction
 - anomaly detection behavior
 - group event aggregation
 
@@ -258,7 +268,6 @@ The tests cover the core pure logic:
 
 ## Roadmap
 
-- Timestamp-based lag correction
 - Rich correlation with deploys, errors, and infra signals
 - AI-generated root-cause explanations
 - Kafka incident timelines
