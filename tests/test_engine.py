@@ -73,6 +73,7 @@ def test_run_once_emits_group_event_and_partition_events() -> None:
     assert events[1].scope == "partition"
     assert events[1].time_lag_source == "timestamp"
     assert events[1].producer_rate is None
+    assert events[1].consumer_efficiency is None
     assert events[2].scope == "partition"
 
 
@@ -332,8 +333,10 @@ def test_detects_system_under_pressure_from_producer_rate() -> None:
 
     assert partition_event.producer_rate == 8.0
     assert partition_event.processing_rate == 3.0
+    assert partition_event.consumer_efficiency == 0.375
     assert partition_event.backlog_growth_rate == 5.0
     assert partition_event.anomaly == "system_under_pressure"
+    assert events[0].consumer_efficiency == 0.375
 
 
 def test_prunes_old_correlation_events_from_ring_buffer() -> None:

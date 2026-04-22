@@ -16,6 +16,7 @@ The current MVP monitors a Kafka consumer group and emits per-partition incident
 - Current offset lag
 - Smoothed processing rate
 - Producer rate and backlog growth rate
+- Consumer efficiency (`consumer_rate / producer_rate`)
 - Estimated time lag with timestamp-based correction
 - Explicit timestamp semantics and lag divergence diagnostics
 - Service-health classification for the consumer group
@@ -36,6 +37,7 @@ Example output:
   "offset_lag": 18250,
   "processing_rate": 320.0,
   "producer_rate": 410.0,
+  "consumer_efficiency": 0.78,
   "backlog_growth_rate": 90.0,
   "time_lag_sec": 92.0,
   "time_lag_source": "timestamp",
@@ -95,6 +97,7 @@ stdout / Slack
 - Continuous polling loop for consumer lag monitoring
 - Sliding rate estimation with short-window smoothing
 - Producer-rate estimation from broker offset movement
+- Consumer-efficiency estimation for catch-up vs steady-state vs falling-behind interpretation
 - Hybrid time-lag estimation using `offset_lag / processing_rate` plus timestamp correction
 - Timestamp sampling cache to avoid per-partition fetch cost on every poll
 - Backlog growth and system-pressure detection
@@ -219,16 +222,17 @@ For each topic partition, the engine:
 3. Estimates consumer processing rate from committed offset movement.
 4. Estimates producer rate from latest broker offset movement.
 5. Smooths both rates with a short moving average to reduce burst noise.
-6. Derives backlog growth rate as `producer_rate - processing_rate`.
-7. Estimates offset-based lag as `offset_lag / processing_rate` when rate is positive.
-8. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
-9. Computes lag velocity from the change in lag over time.
-10. Applies explicit heuristics to classify the partition state.
-11. Resolves conflicting anomaly signals using an explicit priority model.
-12. Applies hysteresis so a new anomaly must be confirmed across multiple polls before it becomes the stable emitted state.
-13. Detects partition skew from cross-partition lag imbalance.
-14. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
-15. Emits structured incident events.
+6. Derives consumer efficiency as `processing_rate / producer_rate` when producer rate is known.
+7. Derives backlog growth rate as `producer_rate - processing_rate`.
+8. Estimates offset-based lag as `offset_lag / processing_rate` when rate is positive.
+9. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
+10. Computes lag velocity from the change in lag over time.
+11. Applies explicit heuristics to classify the partition state.
+12. Resolves conflicting anomaly signals using an explicit priority model.
+13. Applies hysteresis so a new anomaly must be confirmed across multiple polls before it becomes the stable emitted state.
+14. Detects partition skew from cross-partition lag imbalance.
+15. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
+16. Emits structured incident events.
 
 Timestamp correction works like this:
 
@@ -326,6 +330,7 @@ The tests cover the core pure logic:
 
 - Rich correlation with deploys, errors, and infra signals
 - AI-generated root-cause explanations
+- Incident lifecycle and stateful incident tracking
 - Kafka incident timelines
 - More sinks: PagerDuty, Kafka topics, webhooks
 - More backends: SQS, Pub/Sub, and beyond

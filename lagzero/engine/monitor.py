@@ -122,6 +122,13 @@ class MonitorEngine:
             recent_producer_rates = []
 
         producer_rate = smooth_rate(recent_producer_rates, self.settings.rate_window_size)
+        consumer_efficiency = None
+        if (
+            producer_rate is not None
+            and producer_rate > 0
+            and processing_rate is not None
+        ):
+            consumer_efficiency = processing_rate / producer_rate
         backlog_growth_rate = None
         if producer_rate is not None and processing_rate is not None:
             backlog_growth_rate = producer_rate - processing_rate
@@ -227,6 +234,7 @@ class MonitorEngine:
             offset_lag=offset_lag,
             processing_rate=processing_rate,
             producer_rate=producer_rate,
+            consumer_efficiency=consumer_efficiency,
             backlog_growth_rate=backlog_growth_rate,
             time_lag_sec=time_lag_sec,
             time_lag_source=time_lag_estimate.source,
@@ -265,6 +273,7 @@ class MonitorEngine:
                 "catching_up": catching_up,
                 "lag_decreasing": lag_decreasing,
                 "producer_rate": producer_rate,
+                "consumer_efficiency": consumer_efficiency,
                 "backlog_growth_rate": backlog_growth_rate,
                 "lag_divergence_threshold_sec": self.settings.lag_divergence_threshold_sec,
                 "backlog_head_timestamp": snapshot.backlog_head_timestamp,
@@ -320,6 +329,13 @@ class MonitorEngine:
             offset_lag=total_offset_lag,
             processing_rate=total_processing_rate,
             producer_rate=total_producer_rate,
+            consumer_efficiency=(
+                (total_processing_rate / total_producer_rate)
+                if total_processing_rate is not None
+                and total_producer_rate is not None
+                and total_producer_rate > 0
+                else None
+            ),
             backlog_growth_rate=backlog_growth_rate,
             time_lag_sec=max_time_lag,
             time_lag_source=worst_event.time_lag_source,
@@ -356,6 +372,13 @@ class MonitorEngine:
                 "partition_count": len(partition_events),
                 "producer_rate": total_producer_rate,
                 "processing_rate": total_processing_rate,
+                "consumer_efficiency": (
+                    (total_processing_rate / total_producer_rate)
+                    if total_processing_rate is not None
+                    and total_producer_rate is not None
+                    and total_producer_rate > 0
+                    else None
+                ),
                 "backlog_growth_rate": backlog_growth_rate,
                 "affected_partitions": [
                     {
@@ -364,6 +387,7 @@ class MonitorEngine:
                         "offset_lag": event.offset_lag,
                         "producer_rate": event.producer_rate,
                         "processing_rate": event.processing_rate,
+                        "consumer_efficiency": event.consumer_efficiency,
                         "backlog_growth_rate": event.backlog_growth_rate,
                         "time_lag_sec": event.time_lag_sec,
                         "time_lag_source": event.time_lag_source,

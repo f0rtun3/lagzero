@@ -13,6 +13,7 @@ class IncidentEvent:
     offset_lag: int
     processing_rate: float | None
     producer_rate: float | None
+    consumer_efficiency: float | None
     backlog_growth_rate: float | None
     time_lag_sec: float | None
     time_lag_source: str
