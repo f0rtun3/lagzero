@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from dataclasses import replace
 from statistics import median
+import uuid
 
+from lagzero.correlation.engine import CorrelationEngine
+from lagzero.correlation.schema import ExternalEvent
+from lagzero.correlation.store import CorrelationEventStore
 from lagzero.config.settings import Settings
 from lagzero.events.emitter import EventEmitter
 from lagzero.events.schema import IncidentEvent
@@ -27,20 +30,29 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class CorrelationSignal:
-    event_type: str
-    created_at: float
-    attributes: dict[str, object] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
 class MonitorEngine:
     settings: Settings
     offset_fetcher: OffsetFetcher
     event_emitter: EventEmitter
     state_store: InMemoryStateStore = field(default_factory=InMemoryStateStore)
-    correlation_signals: deque[CorrelationSignal] = field(default_factory=deque)
+    correlation_store: CorrelationEventStore | None = None
+    correlation_engine: CorrelationEngine | None = None
     group_decision_state: DecisionState = field(default_factory=DecisionState)
+
+    def __post_init__(self) -> None:
+        if self.correlation_store is None:
+            self.correlation_store = CorrelationEventStore(
+                retention_sec=self.settings.correlation_retention_sec
+            )
+        if self.correlation_engine is None:
+            self.correlation_engine = CorrelationEngine(
+                self.correlation_store,
+                deploy_window_sec=self.settings.deploy_window_sec,
+                error_window_sec=self.settings.error_window_sec,
+                rebalance_window_sec=self.settings.rebalance_window_sec,
+                infra_window_sec=self.settings.infra_window_sec,
+                max_correlations=self.settings.max_correlations,
+            )
 
     def run_forever(self) -> None:
         logger.info(
@@ -63,6 +75,7 @@ class MonitorEngine:
         if partition_events:
             events.append(self._build_group_event(partition_events))
         events.extend(partition_events)
+        events = [self.correlation_engine.enrich(event) for event in events]
 
         for event in events:
             self.event_emitter.emit(event)
@@ -77,15 +90,27 @@ class MonitorEngine:
         event_type: str,
         timestamp: float | None = None,
         attributes: dict[str, object] | None = None,
+        *,
+        source: str = "app",
+        service: str | None = None,
+        consumer_group: str | None = None,
+        topic: str | None = None,
+        partition: int | None = None,
+        severity: str | None = None,
     ) -> None:
-        self.correlation_signals.append(
-            CorrelationSignal(
-                event_type=event_type,
-                created_at=timestamp or time.time(),
-                attributes=attributes or {},
-            )
+        event = ExternalEvent(
+            event_id=str(uuid.uuid4()),
+            timestamp=timestamp or time.time(),
+            event_type=event_type,
+            source=source,
+            service=service,
+            consumer_group=consumer_group or self.settings.consumer_group,
+            topic=topic,
+            partition=partition,
+            severity=severity,
+            metadata=attributes or {},
         )
-        self._prune_correlation_signals(timestamp or time.time())
+        self.correlation_store.add(event)
 
     def _build_partition_event(self, snapshot: PartitionOffsets) -> IncidentEvent:
         key = (snapshot.topic, snapshot.partition)
@@ -206,8 +231,6 @@ class MonitorEngine:
         final_service_health = health_for_anomaly(final_anomaly)
         final_confidence = anomaly.confidence if final_anomaly == anomaly.name else min(anomaly.confidence, 0.5)
 
-        correlations = self._collect_correlations(snapshot.observed_at)
-
         self.state_store.set(
             key,
             PartitionState(
@@ -247,7 +270,6 @@ class MonitorEngine:
             severity=final_severity,
             service_health=final_service_health,
             confidence=final_confidence,
-            correlations=correlations,
             diagnostics={
                 "observed_anomaly": anomaly.name,
                 "observed_severity": anomaly.severity,
@@ -401,18 +423,6 @@ class MonitorEngine:
                 ],
             },
         )
-
-    def _collect_correlations(self, observed_at: float) -> list[str]:
-        self._prune_correlation_signals(observed_at)
-        active_signals = []
-        for signal in self.correlation_signals:
-            active_signals.append(signal.event_type)
-        return sorted(set(active_signals))
-
-    def _prune_correlation_signals(self, observed_at: float) -> None:
-        valid_after = observed_at - self.settings.correlation_window_sec
-        while self.correlation_signals and self.correlation_signals[0].created_at < valid_after:
-            self.correlation_signals.popleft()
 
     def _apply_partition_skew(self, partition_events: list[IncidentEvent]) -> list[IncidentEvent]:
         if len(partition_events) < 2:

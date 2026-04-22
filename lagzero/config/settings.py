@@ -38,6 +38,12 @@ class Settings:
     timestamp_sample_interval_sec: float = 30.0
     lag_divergence_threshold_sec: float = 120.0
     state_transition_confirmations: int = 2
+    correlation_retention_sec: float = 900.0
+    deploy_window_sec: float = 300.0
+    error_window_sec: float = 120.0
+    rebalance_window_sec: float = 90.0
+    infra_window_sec: float = 300.0
+    max_correlations: int = 3
     slack_webhook_url: str | None = None
     correlation_window_sec: float = 900.0
 
@@ -73,6 +79,24 @@ class Settings:
             ),
             state_transition_confirmations=_parse_optional_int(
                 os.getenv("LAGZERO_STATE_TRANSITION_CONFIRMATIONS"), 2
+            ),
+            correlation_retention_sec=_parse_optional_float(
+                os.getenv("LAGZERO_CORRELATION_RETENTION_SEC"), 900.0
+            ),
+            deploy_window_sec=_parse_optional_float(
+                os.getenv("LAGZERO_DEPLOY_WINDOW_SEC"), 300.0
+            ),
+            error_window_sec=_parse_optional_float(
+                os.getenv("LAGZERO_ERROR_WINDOW_SEC"), 120.0
+            ),
+            rebalance_window_sec=_parse_optional_float(
+                os.getenv("LAGZERO_REBALANCE_WINDOW_SEC"), 90.0
+            ),
+            infra_window_sec=_parse_optional_float(
+                os.getenv("LAGZERO_INFRA_WINDOW_SEC"), 300.0
+            ),
+            max_correlations=_parse_optional_int(
+                os.getenv("LAGZERO_MAX_CORRELATIONS"), 3
             ),
             slack_webhook_url=os.getenv("LAGZERO_SLACK_WEBHOOK_URL") or None,
             correlation_window_sec=_parse_optional_float(

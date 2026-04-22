@@ -51,8 +51,25 @@ Example output:
   "service_health": null,
   "confidence": 0.75,
   "correlations": [
-    "deploy_within_window"
+    {
+      "correlation_type": "deploy_within_window",
+      "event_id": "evt-123",
+      "event_type": "deploy",
+      "source": "cli",
+      "service": null,
+      "confidence": 0.883,
+      "time_diff_sec": 42.0,
+      "role": "probable_cause",
+      "metadata": {
+        "consumer_group": "payments-consumer",
+        "topic": "orders",
+        "partition": null,
+        "severity": null
+      }
+    }
   ],
+  "primary_cause": "deploy_within_window",
+  "primary_cause_confidence": 0.883,
   "diagnostics": {
     "raw_processing_rate": 400.0,
     "raw_producer_rate": 450.0,
@@ -109,6 +126,7 @@ stdout / Slack
 - Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, estimation mismatch, cold-start catch-up, pressure, and offset resets
 - Explicit consumer-group service health: `healthy`, `degraded`, `failing`, `recovering`
 - In-memory correlation window for recent operational events
+- Deterministic correlation engine with primary-cause selection
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
 
@@ -211,6 +229,12 @@ LagZero is configured through environment variables:
 | `LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC` | Minimum interval between timestamp sampling attempts per partition | `30` |
 | `LAGZERO_LAG_DIVERGENCE_THRESHOLD_SEC` | Threshold for flagging measured vs estimated lag mismatch | `120` |
 | `LAGZERO_STATE_TRANSITION_CONFIRMATIONS` | Consecutive confirmations required before a new state becomes stable | `2` |
+| `LAGZERO_CORRELATION_RETENTION_SEC` | Retention window for external events kept in memory | `900` |
+| `LAGZERO_DEPLOY_WINDOW_SEC` | Matching window for deploy correlation | `300` |
+| `LAGZERO_ERROR_WINDOW_SEC` | Matching window for error correlation | `120` |
+| `LAGZERO_REBALANCE_WINDOW_SEC` | Matching window for rebalance correlation | `90` |
+| `LAGZERO_INFRA_WINDOW_SEC` | Matching window for infrastructure correlation | `300` |
+| `LAGZERO_MAX_CORRELATIONS` | Maximum matches attached to an incident | `3` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -232,7 +256,8 @@ For each topic partition, the engine:
 13. Applies hysteresis so a new anomaly must be confirmed across multiple polls before it becomes the stable emitted state.
 14. Detects partition skew from cross-partition lag imbalance.
 15. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
-16. Emits structured incident events.
+16. Runs deterministic correlation against recent external events.
+17. Emits enriched incident events.
 
 Timestamp correction works like this:
 
@@ -293,6 +318,14 @@ engine.add_external_event(event_type="deploy", timestamp=time.time())
 
 Recent external events are retained in an in-memory time window and attached to emitted incidents as correlation context. This keeps correlation grounded in a defined MVP interface instead of leaving it as a placeholder concept.
 
+The correlation engine:
+
+1. Retains recent external events in a bounded in-memory FIFO store.
+2. Filters by relevance using consumer group, topic, and partition alignment.
+3. Applies deterministic rules such as `deploy_within_window`, `error_nearby`, `rebalance_overlap`, and `infra_change_nearby`.
+4. Scores matches by time proximity, scope match, and rule relevance.
+5. Selects a `primary_cause` and keeps the next strongest matches as supporting evidence.
+
 ## Slack Output
 
 Set:
@@ -318,6 +351,7 @@ The tests cover the core pure logic:
 - anomaly detection behavior
 - group event aggregation and service health
 - producer pressure, partition skew, and correlation retention
+- correlation rule matching, scoring, and primary-cause selection
 
 ## Design Principles
 

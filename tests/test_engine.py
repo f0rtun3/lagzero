@@ -90,7 +90,7 @@ def test_external_event_is_exposed_as_correlation() -> None:
                 topic="orders",
                 partition=0,
                 committed_offset=100,
-                latest_offset=120,
+                latest_offset=200,
                 observed_at=10.0,
                 backlog_head_timestamp=8.0,
                 latest_message_timestamp=9.0,
@@ -102,12 +102,25 @@ def test_external_event_is_exposed_as_correlation() -> None:
     )
     emitter = CollectingEmitter()
     engine = MonitorEngine(settings=settings, offset_fetcher=fetcher, event_emitter=emitter)
+    engine.state_store.set(
+        ("orders", 0),
+        PartitionState(
+            committed_offset=90,
+            latest_offset=120,
+            observed_at=0.0,
+            offset_lag=30,
+            recent_rates=[1.0],
+            recent_producer_rates=[1.0],
+        ),
+    )
     engine.add_external_event(event_type="deploy", timestamp=9.0)
 
     events = engine.run_once()
 
-    assert events[0].correlations == ["deploy"]
-    assert events[1].correlations == ["deploy"]
+    assert events[0].primary_cause == "deploy_within_window"
+    assert events[1].primary_cause == "deploy_within_window"
+    assert events[0].correlations[0]["event_type"] == "deploy"
+    assert events[1].correlations[0]["correlation_type"] == "deploy_within_window"
 
 
 def test_partition_event_exposes_offset_and_timestamp_time_lag_diagnostics() -> None:
@@ -344,7 +357,7 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
-        correlation_window_sec=60.0,
+        correlation_retention_sec=60.0,
         state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
@@ -361,12 +374,22 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
     )
     emitter = CollectingEmitter()
     engine = MonitorEngine(settings=settings, offset_fetcher=fetcher, event_emitter=emitter)
+    engine.state_store.set(
+        ("orders", 0),
+        PartitionState(
+            committed_offset=100,
+            latest_offset=120,
+            observed_at=190.0,
+            offset_lag=20,
+            consecutive_zero_rate_intervals=1,
+        ),
+    )
     engine.add_external_event(event_type="deploy", timestamp=100.0)
     engine.add_external_event(event_type="error", timestamp=180.0)
 
     events = engine.run_once()
 
-    assert events[0].correlations == ["error"]
+    assert [match["event_type"] for match in events[0].correlations] == ["error"]
 
 
 def test_hysteresis_requires_confirmation_before_state_transition() -> None:

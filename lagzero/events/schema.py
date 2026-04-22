@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +27,10 @@ class IncidentEvent:
     severity: str
     service_health: str | None
     confidence: float
-    correlations: list[str] = field(default_factory=list)
-    diagnostics: dict[str, object] = field(default_factory=dict)
+    correlations: list[dict[str, Any]] = field(default_factory=list)
+    primary_cause: str | None = None
+    primary_cause_confidence: float | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
