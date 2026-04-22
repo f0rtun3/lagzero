@@ -2,6 +2,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+ANOMALY_PRIORITY = {
+    "consumer_stalled": 100,
+    "offset_reset": 90,
+    "system_under_pressure": 80,
+    "partition_skew": 70,
+    "lag_estimation_mismatch": 65,
+    "lag_spike": 60,
+    "idle_but_delayed": 50,
+    "catching_up": 40,
+    "normal": 0,
+}
+
+ANOMALY_SEVERITY = {
+    "consumer_stalled": "critical",
+    "offset_reset": "info",
+    "system_under_pressure": "warning",
+    "partition_skew": "warning",
+    "lag_estimation_mismatch": "warning",
+    "lag_spike": "warning",
+    "idle_but_delayed": "warning",
+    "catching_up": "info",
+    "normal": "info",
+}
+
+ANOMALY_HEALTH = {
+    "consumer_stalled": "failing",
+    "offset_reset": "healthy",
+    "system_under_pressure": "degraded",
+    "partition_skew": "degraded",
+    "lag_estimation_mismatch": "degraded",
+    "lag_spike": "degraded",
+    "idle_but_delayed": "degraded",
+    "catching_up": "recovering",
+    "normal": "healthy",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class AnomalyResult:
@@ -43,6 +79,7 @@ def detect_anomaly(
         timestamp_type=timestamp_type,
     )
 
+    candidates = ["normal"]
     if state_reset:
         return AnomalyResult(name="offset_reset", severity="info", confidence=0.95)
 
@@ -50,7 +87,7 @@ def detect_anomaly(
         return AnomalyResult(name="normal", severity="info", confidence=0.95)
 
     if catching_up:
-        return AnomalyResult(name="catching_up", severity="info", confidence=confidence)
+        candidates.append("catching_up")
 
     if (
         producer_rate is not None
@@ -59,31 +96,27 @@ def detect_anomaly(
         and producer_rate > processing_rate
         and backlog_growth_rate > 0
     ):
-        return AnomalyResult(name="system_under_pressure", severity="warning", confidence=confidence)
+        candidates.append("system_under_pressure")
 
     if (
         lag_divergence_sec is not None
         and lag_divergence_sec >= lag_divergence_threshold_sec
     ):
-        return AnomalyResult(
-            name="lag_estimation_mismatch",
-            severity="warning",
-            confidence=confidence,
-        )
+        candidates.append("lag_estimation_mismatch")
 
     if (
         no_offset_movement
         and consecutive_no_movement_intervals >= idle_intervals
         and current_lag > 0
     ):
-        return AnomalyResult(name="idle_but_delayed", severity="warning", confidence=confidence)
+        candidates.append("idle_but_delayed")
 
     if (
         processing_rate == 0
         and consecutive_zero_rate_intervals >= stalled_intervals
         and current_lag > 0
     ):
-        return AnomalyResult(name="consumer_stalled", severity="critical", confidence=confidence)
+        candidates.append("consumer_stalled")
 
     if (
         previous_lag is not None
@@ -93,12 +126,14 @@ def detect_anomaly(
             or (lag_velocity is not None and lag_velocity > 0)
         )
     ):
-        return AnomalyResult(name="lag_spike", severity="warning", confidence=confidence)
+        candidates.append("lag_spike")
 
-    if processing_rate is None:
-        return AnomalyResult(name="normal", severity="info", confidence=confidence)
-
-    return AnomalyResult(name="normal", severity="info", confidence=confidence)
+    final_anomaly = resolve_anomaly(candidates)
+    return AnomalyResult(
+        name=final_anomaly,
+        severity=severity_for_anomaly(final_anomaly),
+        confidence=confidence,
+    )
 
 
 def _compute_confidence(
@@ -136,3 +171,15 @@ def _compute_confidence(
     ):
         return min(base_confidence, 0.5)
     return base_confidence
+
+
+def resolve_anomaly(candidates: list[str]) -> str:
+    return max(candidates, key=lambda name: ANOMALY_PRIORITY.get(name, 0))
+
+
+def severity_for_anomaly(anomaly_name: str) -> str:
+    return ANOMALY_SEVERITY.get(anomaly_name, "info")
+
+
+def health_for_anomaly(anomaly_name: str) -> str:
+    return ANOMALY_HEALTH.get(anomaly_name, "healthy")

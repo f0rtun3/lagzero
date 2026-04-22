@@ -37,6 +37,7 @@ class Settings:
     rate_window_size: int = 3
     timestamp_sample_interval_sec: float = 30.0
     lag_divergence_threshold_sec: float = 120.0
+    state_transition_confirmations: int = 2
     slack_webhook_url: str | None = None
     correlation_window_sec: float = 900.0
 
@@ -69,6 +70,9 @@ class Settings:
             ),
             lag_divergence_threshold_sec=_parse_optional_float(
                 os.getenv("LAGZERO_LAG_DIVERGENCE_THRESHOLD_SEC"), 120.0
+            ),
+            state_transition_confirmations=_parse_optional_int(
+                os.getenv("LAGZERO_STATE_TRANSITION_CONFIRMATIONS"), 2
             ),
             slack_webhook_url=os.getenv("LAGZERO_SLACK_WEBHOOK_URL") or None,
             correlation_window_sec=_parse_optional_float(

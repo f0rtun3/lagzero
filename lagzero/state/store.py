@@ -7,6 +7,13 @@ PartitionKey = tuple[str, int]
 
 
 @dataclass(slots=True)
+class DecisionState:
+    confirmed_anomaly: str = "normal"
+    pending_anomaly: str | None = None
+    pending_count: int = 0
+
+
+@dataclass(slots=True)
 class PartitionState:
     committed_offset: int
     latest_offset: int
@@ -18,6 +25,7 @@ class PartitionState:
     recent_producer_rates: list[float] = field(default_factory=list)
     lag_velocity: float | None = None
     last_time_lag_sec: float | None = None
+    decision_state: DecisionState = field(default_factory=DecisionState)
 
 
 class InMemoryStateStore:

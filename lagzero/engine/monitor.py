@@ -11,12 +11,17 @@ from lagzero.config.settings import Settings
 from lagzero.events.emitter import EventEmitter
 from lagzero.events.schema import IncidentEvent
 from lagzero.kafka.offsets import OffsetFetcher, PartitionOffsets
-from lagzero.monitoring.anomaly import detect_anomaly
+from lagzero.monitoring.anomaly import (
+    ANOMALY_PRIORITY,
+    detect_anomaly,
+    health_for_anomaly,
+    severity_for_anomaly,
+)
 from lagzero.monitoring.lag_calculator import compute_lag
 from lagzero.monitoring.lag_velocity import compute_lag_velocity
 from lagzero.monitoring.rate_calculator import compute_rate, rate_variance_high, smooth_rate
 from lagzero.monitoring.time_lag import compute_time_lag
-from lagzero.state.store import InMemoryStateStore, PartitionState
+from lagzero.state.store import DecisionState, InMemoryStateStore, PartitionState
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class MonitorEngine:
     event_emitter: EventEmitter
     state_store: InMemoryStateStore = field(default_factory=InMemoryStateStore)
     correlation_signals: deque[CorrelationSignal] = field(default_factory=deque)
+    group_decision_state: DecisionState = field(default_factory=DecisionState)
 
     def run_forever(self) -> None:
         logger.info(
@@ -183,6 +189,15 @@ class MonitorEngine:
             producer_rate=producer_rate,
             backlog_growth_rate=backlog_growth_rate,
         )
+        final_anomaly, updated_decision_state, transition_pending = self._apply_hysteresis(
+            decision_state=(
+                previous_state.decision_state if previous_state is not None else DecisionState()
+            ),
+            observed_anomaly=anomaly.name,
+        )
+        final_severity = severity_for_anomaly(final_anomaly)
+        final_service_health = health_for_anomaly(final_anomaly)
+        final_confidence = anomaly.confidence if final_anomaly == anomaly.name else min(anomaly.confidence, 0.5)
 
         correlations = self._collect_correlations(snapshot.observed_at)
 
@@ -199,6 +214,7 @@ class MonitorEngine:
                 recent_producer_rates=recent_producer_rates[-self.settings.rate_window_size :],
                 lag_velocity=lag_velocity,
                 last_time_lag_sec=time_lag_sec,
+                decision_state=updated_decision_state,
             ),
         )
 
@@ -219,12 +235,19 @@ class MonitorEngine:
             latest_message_timestamp=snapshot.latest_message_timestamp,
             lag_divergence_sec=time_lag_estimate.lag_divergence_sec,
             lag_velocity=lag_velocity,
-            anomaly=anomaly.name,
-            severity=anomaly.severity,
-            service_health=None,
-            confidence=anomaly.confidence,
+            anomaly=final_anomaly,
+            severity=final_severity,
+            service_health=final_service_health,
+            confidence=final_confidence,
             correlations=correlations,
             diagnostics={
+                "observed_anomaly": anomaly.name,
+                "observed_severity": anomaly.severity,
+                "anomaly_priority": ANOMALY_PRIORITY.get(final_anomaly, 0),
+                "transition_pending": transition_pending,
+                "pending_anomaly": updated_decision_state.pending_anomaly,
+                "pending_count": updated_decision_state.pending_count,
+                "required_confirmations": self.settings.state_transition_confirmations,
                 "raw_processing_rate": rate_sample.messages_per_second,
                 "raw_producer_rate": producer_rate_sample.messages_per_second,
                 "rate_window_size": self.settings.rate_window_size,
@@ -274,7 +297,19 @@ class MonitorEngine:
             (event.lag_velocity for event in partition_events if event.lag_velocity is not None),
             default=None,
         )
-        service_health = self._compute_service_health(partition_events)
+        observed_group_anomaly = worst_event.anomaly or "normal"
+        final_group_anomaly, updated_group_decision_state, transition_pending = self._apply_hysteresis(
+            decision_state=self.group_decision_state,
+            observed_anomaly=observed_group_anomaly,
+        )
+        self.group_decision_state = updated_group_decision_state
+        final_group_severity = severity_for_anomaly(final_group_anomaly)
+        service_health = health_for_anomaly(final_group_anomaly)
+        final_group_confidence = (
+            min(event.confidence for event in partition_events)
+            if final_group_anomaly == observed_group_anomaly
+            else min(min(event.confidence for event in partition_events), 0.5)
+        )
 
         return IncidentEvent(
             timestamp=max(event.timestamp for event in partition_events),
@@ -300,18 +335,24 @@ class MonitorEngine:
                 default=None,
             ),
             lag_velocity=max_lag_velocity,
-            anomaly=worst_event.anomaly,
-            severity=worst_event.severity,
+            anomaly=final_group_anomaly,
+            severity=final_group_severity,
             service_health=service_health,
-            confidence=min(event.confidence for event in partition_events),
+            confidence=final_group_confidence,
             correlations=sorted(
                 {correlation for event in partition_events for correlation in event.correlations}
             ),
             diagnostics={
                 "group_time_lag_sec": max_time_lag,
-                "group_anomaly": worst_event.anomaly,
-                "group_severity": worst_event.severity,
+                "group_anomaly": final_group_anomaly,
+                "observed_group_anomaly": observed_group_anomaly,
+                "group_severity": final_group_severity,
                 "service_health": service_health,
+                "anomaly_priority": ANOMALY_PRIORITY.get(final_group_anomaly, 0),
+                "transition_pending": transition_pending,
+                "pending_anomaly": updated_group_decision_state.pending_anomaly,
+                "pending_count": updated_group_decision_state.pending_count,
+                "required_confirmations": self.settings.state_transition_confirmations,
                 "partition_count": len(partition_events),
                 "producer_rate": total_producer_rate,
                 "processing_rate": total_processing_rate,
@@ -360,13 +401,27 @@ class MonitorEngine:
         result: list[IncidentEvent] = []
         for event in partition_events:
             if event.offset_lag >= lag_median * 3 and event.offset_lag > 0:
+                if ANOMALY_PRIORITY.get(event.anomaly or "normal", 0) >= ANOMALY_PRIORITY["partition_skew"]:
+                    result.append(
+                        replace(
+                            event,
+                            diagnostics={
+                                **event.diagnostics,
+                                "partition_skew": True,
+                                "median_partition_lag": lag_median,
+                            },
+                        )
+                    )
+                    continue
                 result.append(
                     replace(
                         event,
                         anomaly="partition_skew",
                         severity="warning",
+                        service_health=health_for_anomaly("partition_skew"),
                         diagnostics={
                             **event.diagnostics,
+                            "observed_anomaly": "partition_skew",
                             "partition_skew": True,
                             "median_partition_lag": lag_median,
                         },
@@ -376,17 +431,42 @@ class MonitorEngine:
                 result.append(event)
         return result
 
-    def _compute_service_health(self, partition_events: list[IncidentEvent]) -> str:
-        worst_event = max(partition_events, key=self._event_rank)
-        if worst_event.anomaly == "catching_up":
-            return "recovering"
-        if worst_event.severity == "critical":
-            return "failing"
-        if worst_event.severity == "warning":
-            return "degraded"
-        return "healthy"
+    def _apply_hysteresis(
+        self,
+        *,
+        decision_state: DecisionState,
+        observed_anomaly: str,
+    ) -> tuple[str, DecisionState, bool]:
+        confirmed_anomaly = decision_state.confirmed_anomaly
+        if observed_anomaly == confirmed_anomaly:
+            return (
+                confirmed_anomaly,
+                DecisionState(confirmed_anomaly=confirmed_anomaly),
+                False,
+            )
+
+        if decision_state.pending_anomaly == observed_anomaly:
+            pending_count = decision_state.pending_count + 1
+        else:
+            pending_count = 1
+
+        if pending_count >= self.settings.state_transition_confirmations:
+            return (
+                observed_anomaly,
+                DecisionState(confirmed_anomaly=observed_anomaly),
+                False,
+            )
+
+        return (
+            confirmed_anomaly,
+            DecisionState(
+                confirmed_anomaly=confirmed_anomaly,
+                pending_anomaly=observed_anomaly,
+                pending_count=pending_count,
+            ),
+            True,
+        )
 
     @staticmethod
     def _event_rank(event: IncidentEvent) -> tuple[int, float]:
-        severity_rank = {"critical": 3, "warning": 2, "info": 1}.get(event.severity, 0)
-        return (severity_rank, event.time_lag_sec or 0.0)
+        return (ANOMALY_PRIORITY.get(event.anomaly or "normal", 0), event.time_lag_sec or 0.0)

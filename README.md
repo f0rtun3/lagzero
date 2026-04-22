@@ -100,6 +100,8 @@ stdout / Slack
 - Backlog growth and system-pressure detection
 - Lag velocity derived from lag deltas over time
 - Group-level incident synthesis with partition diagnostics
+- Anomaly priority and conflict resolution across competing signals
+- Stable state transitions with confirmation-based hysteresis
 - Partition-skew detection for Kafka hotspots
 - Heuristic anomaly detection for stalled consumers, lag spikes, idle-but-delayed states, estimation mismatch, cold-start catch-up, pressure, and offset resets
 - Explicit consumer-group service health: `healthy`, `degraded`, `failing`, `recovering`
@@ -205,6 +207,7 @@ LagZero is configured through environment variables:
 | `LAGZERO_RATE_WINDOW_SIZE` | Number of intervals used for rate smoothing | `3` |
 | `LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC` | Minimum interval between timestamp sampling attempts per partition | `30` |
 | `LAGZERO_LAG_DIVERGENCE_THRESHOLD_SEC` | Threshold for flagging measured vs estimated lag mismatch | `120` |
+| `LAGZERO_STATE_TRANSITION_CONFIRMATIONS` | Consecutive confirmations required before a new state becomes stable | `2` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -221,9 +224,11 @@ For each topic partition, the engine:
 8. Samples Kafka record timestamps for the backlog head when available and uses that to correct time lag.
 9. Computes lag velocity from the change in lag over time.
 10. Applies explicit heuristics to classify the partition state.
-11. Detects partition skew from cross-partition lag imbalance.
-12. Synthesizes a consumer-group incident using worst-case partition truth and explicit service-health rules.
-13. Emits structured incident events.
+11. Resolves conflicting anomaly signals using an explicit priority model.
+12. Applies hysteresis so a new anomaly must be confirmed across multiple polls before it becomes the stable emitted state.
+13. Detects partition skew from cross-partition lag imbalance.
+14. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
+15. Emits structured incident events.
 
 Timestamp correction works like this:
 
@@ -244,6 +249,18 @@ Initial heuristics:
 - `offset_reset`: committed offset moved backward, so state was reset intentionally
 - `catching_up`: consumer is cold-starting and reducing lag at a healthy rate
 - `normal`: no anomaly detected
+
+When multiple signals are true at once, LagZero resolves them by priority before emitting a final anomaly. Examples:
+
+- `consumer_stalled` outranks `partition_skew`
+- `system_under_pressure` outranks `lag_spike`
+- `catching_up` only wins when higher-priority failure signals are absent
+
+LagZero also applies hysteresis to avoid flapping:
+
+- a newly observed anomaly must be confirmed across `LAGZERO_STATE_TRANSITION_CONFIRMATIONS` consecutive polls
+- until then, the previously stable anomaly and health state remain in place
+- pending transitions are exposed in event diagnostics
 
 Consumer-group service health is derived explicitly:
 

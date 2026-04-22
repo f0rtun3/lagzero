@@ -28,6 +28,7 @@ def test_run_once_emits_group_event_and_partition_events() -> None:
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -80,6 +81,7 @@ def test_external_event_is_exposed_as_correlation() -> None:
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -112,6 +114,7 @@ def test_partition_event_exposes_offset_and_timestamp_time_lag_diagnostics() -> 
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -148,6 +151,7 @@ def test_cold_start_uses_estimated_fallback_and_marks_catching_up_on_next_cycle(
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     emitter = CollectingEmitter()
     engine = MonitorEngine(
@@ -199,6 +203,7 @@ def test_timestamp_divergence_is_exposed_in_partition_event() -> None:
         consumer_group="payments",
         topics=["orders"],
         lag_divergence_threshold_sec=10.0,
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -242,6 +247,7 @@ def test_detects_partition_skew_and_group_health() -> None:
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -288,6 +294,7 @@ def test_detects_system_under_pressure_from_producer_rate() -> None:
         bootstrap_servers="localhost:9092",
         consumer_group="payments",
         topics=["orders"],
+        state_transition_confirmations=1,
     )
     emitter = CollectingEmitter()
     engine = MonitorEngine(
@@ -335,6 +342,7 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
         consumer_group="payments",
         topics=["orders"],
         correlation_window_sec=60.0,
+        state_transition_confirmations=1,
     )
     fetcher = FakeOffsetFetcher(
         snapshots=[
@@ -356,3 +364,51 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
     events = engine.run_once()
 
     assert events[0].correlations == ["error"]
+
+
+def test_hysteresis_requires_confirmation_before_state_transition() -> None:
+    settings = Settings(
+        bootstrap_servers="localhost:9092",
+        consumer_group="payments",
+        topics=["orders"],
+        state_transition_confirmations=2,
+    )
+    emitter = CollectingEmitter()
+    engine = MonitorEngine(
+        settings=settings,
+        offset_fetcher=FakeOffsetFetcher(
+            snapshots=[
+                PartitionOffsets(
+                    topic="orders",
+                    partition=0,
+                    committed_offset=100,
+                    latest_offset=120,
+                    observed_at=10.0,
+                    timestamp_sampling_state="sampling_failed",
+                ),
+            ]
+        ),
+        event_emitter=emitter,
+    )
+    engine.run_once()
+    engine.offset_fetcher = FakeOffsetFetcher(
+        snapshots=[
+            PartitionOffsets(
+                topic="orders",
+                partition=0,
+                committed_offset=130,
+                latest_offset=200,
+                observed_at=20.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+        ]
+    )
+
+    second_events = engine.run_once()
+    assert second_events[1].anomaly == "normal"
+    assert second_events[1].diagnostics["transition_pending"] is True
+    assert second_events[1].diagnostics["pending_anomaly"] == "system_under_pressure"
+
+    third_events = engine.run_once()
+    assert third_events[1].anomaly == "system_under_pressure"
+    assert third_events[1].service_health == "degraded"

@@ -1,4 +1,4 @@
-from lagzero.monitoring.anomaly import detect_anomaly
+from lagzero.monitoring.anomaly import detect_anomaly, health_for_anomaly, resolve_anomaly
 
 
 def test_detects_stalled_consumer() -> None:
@@ -211,3 +211,14 @@ def test_detects_system_under_pressure() -> None:
     )
 
     assert result.name == "system_under_pressure"
+
+
+def test_priority_model_prefers_more_severe_anomaly() -> None:
+    assert resolve_anomaly(["catching_up", "lag_spike", "system_under_pressure"]) == "system_under_pressure"
+
+
+def test_health_is_derived_explicitly_from_anomaly() -> None:
+    assert health_for_anomaly("consumer_stalled") == "failing"
+    assert health_for_anomaly("system_under_pressure") == "degraded"
+    assert health_for_anomaly("catching_up") == "recovering"
+    assert health_for_anomaly("normal") == "healthy"
