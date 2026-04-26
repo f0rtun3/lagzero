@@ -52,8 +52,11 @@ class KafkaOffsetFetcher:
         try:
             self._consumer = build_consumer(
                 bootstrap_servers=bootstrap_servers,
-                consumer_group=consumer_group,
+                consumer_group=None,
             )
+            from kafka import KafkaAdminClient
+            self._admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers, client_id="lagzero-admin")
+            self._consumer_group = consumer_group
         except ImportError as exc:  # pragma: no cover - depends on optional dependency state.
             raise RuntimeError(
                 "kafka-python is required for Kafka access. Install with: pip install -e '.[kafka]'"
@@ -74,7 +77,15 @@ class KafkaOffsetFetcher:
             latest_offsets = self._consumer.end_offsets(topic_partitions)
 
             for topic_partition in topic_partitions:
-                committed_offset = self._consumer.committed(topic_partition)
+                committed_offset = None
+                try:
+                    group_offsets = self._admin.list_consumer_group_offsets(
+                        self._consumer_group, partitions=[topic_partition]
+                    )
+                    meta = group_offsets.get(topic_partition)
+                    committed_offset = getattr(meta, "offset", None) if meta is not None else None
+                except Exception:
+                    committed_offset = None
                 normalized_committed_offset = committed_offset if committed_offset is not None else 0
                 latest_offset = latest_offsets.get(topic_partition, 0)
                 timestamp_sample = self._get_timestamp_sample(
@@ -209,3 +220,6 @@ class KafkaOffsetFetcher:
 
     def close(self) -> None:
         self._consumer.close()
+        admin = getattr(self, "_admin", None)
+        if admin is not None:
+            admin.close()

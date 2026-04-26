@@ -7,6 +7,8 @@ from dataclasses import replace
 from statistics import median
 import uuid
 
+from lagzero.ai.client import DisabledLLMClient
+from lagzero.ai.explainer import IncidentExplainer
 from lagzero.correlation.engine import CorrelationEngine
 from lagzero.correlation.schema import ExternalEvent
 from lagzero.correlation.store import CorrelationEventStore
@@ -37,6 +39,7 @@ class MonitorEngine:
     state_store: InMemoryStateStore = field(default_factory=InMemoryStateStore)
     correlation_store: CorrelationEventStore | None = None
     correlation_engine: CorrelationEngine | None = None
+    incident_explainer: IncidentExplainer | None = None
     group_decision_state: DecisionState = field(default_factory=DecisionState)
 
     def __post_init__(self) -> None:
@@ -52,6 +55,12 @@ class MonitorEngine:
                 rebalance_window_sec=self.settings.rebalance_window_sec,
                 infra_window_sec=self.settings.infra_window_sec,
                 max_correlations=self.settings.max_correlations,
+            )
+        if self.incident_explainer is None:
+            self.incident_explainer = IncidentExplainer(
+                llm_client=DisabledLLMClient(),
+                enabled=self.settings.ai_enabled,
+                cache_ttl_sec=self.settings.ai_cache_ttl_sec,
             )
 
     def run_forever(self) -> None:
@@ -76,6 +85,7 @@ class MonitorEngine:
             events.append(self._build_group_event(partition_events))
         events.extend(partition_events)
         events = [self.correlation_engine.enrich(event) for event in events]
+        events = [self.incident_explainer.explain(event) for event in events]
 
         for event in events:
             self.event_emitter.emit(event)
@@ -157,6 +167,12 @@ class MonitorEngine:
         backlog_growth_rate = None
         if producer_rate is not None and processing_rate is not None:
             backlog_growth_rate = producer_rate - processing_rate
+        backlog_growth_rate_improving = (
+            previous_state is not None
+            and backlog_growth_rate is not None
+            and previous_state.last_backlog_growth_rate is not None
+            and backlog_growth_rate < previous_state.last_backlog_growth_rate
+        )
         time_lag_estimate = compute_time_lag(
             offset_lag=offset_lag,
             processing_rate=processing_rate,
@@ -172,6 +188,19 @@ class MonitorEngine:
             current_lag=offset_lag,
             elapsed_seconds=rate_sample.elapsed_seconds,
         )
+        spike_signal_active = (
+            previous_state is not None
+            and previous_state.offset_lag > 0
+            and (offset_lag - previous_state.offset_lag) >= self.settings.min_lag_spike_delta
+            and (
+                offset_lag
+                >= int(previous_state.offset_lag * self.settings.lag_spike_multiplier)
+                or (
+                    lag_velocity is not None
+                    and lag_velocity >= float(self.settings.min_lag_spike_delta)
+                )
+            )
+        )
         no_offset_movement = (
             previous_state is not None
             and snapshot.committed_offset == previous_state.committed_offset
@@ -181,11 +210,24 @@ class MonitorEngine:
         cold_start = snapshot.committed_offset == 0 or (
             previous_state is not None and previous_state.committed_offset == 0
         )
+        recent_lag_spike_active = (
+            previous_state is not None
+            and previous_state.last_lag_spike_at is not None
+            and (snapshot.observed_at - previous_state.last_lag_spike_at)
+            <= self.settings.burst_grace_sec
+        )
         catching_up = (
-            cold_start
-            and processing_rate is not None
+            processing_rate is not None
             and processing_rate > 0
             and lag_decreasing
+            and (
+                cold_start
+                or (backlog_growth_rate is not None and backlog_growth_rate < 0)
+                or (
+                    consumer_efficiency is not None
+                    and consumer_efficiency >= self.settings.catching_up_efficiency_threshold
+                )
+            )
         )
 
         consecutive_zero_rate_intervals = 0
@@ -200,6 +242,19 @@ class MonitorEngine:
                 previous_state.consecutive_no_movement_intervals + 1 if previous_state else 1
             )
 
+        operator_offset_reset = (
+            previous_state is not None
+            and previous_state.offset_lag >= self.settings.min_incident_offset_lag
+            and previous_state.offset_lag > 0
+            and offset_lag == 0
+            and rate_sample.messages_per_second is not None
+            and rate_sample.processed_messages >= max(10, int(previous_state.offset_lag * 0.8))
+            and (
+                previous_state.consecutive_no_movement_intervals >= 1
+                or previous_state.consecutive_zero_rate_intervals >= 1
+            )
+
+        )
         anomaly = detect_anomaly(
             current_lag=offset_lag,
             previous_lag=previous_state.offset_lag if previous_state else None,
@@ -212,14 +267,25 @@ class MonitorEngine:
             rate_variance_high=rate_variance_high(recent_rates, self.settings.rate_window_size),
             lag_velocity=lag_velocity,
             no_offset_movement=no_offset_movement,
-            state_reset=rate_sample.state_reset,
+            state_reset=(rate_sample.state_reset or operator_offset_reset),
             lag_divergence_sec=time_lag_estimate.lag_divergence_sec,
             lag_divergence_threshold_sec=self.settings.lag_divergence_threshold_sec,
             time_lag_source=time_lag_estimate.source,
             timestamp_type=time_lag_estimate.timestamp_type,
             catching_up=catching_up,
+            time_lag_sec=time_lag_sec,
             producer_rate=producer_rate,
             backlog_growth_rate=backlog_growth_rate,
+            consumer_efficiency=consumer_efficiency,
+            lag_decreasing=lag_decreasing,
+            backlog_growth_rate_improving=backlog_growth_rate_improving,
+            recent_lag_spike_active=recent_lag_spike_active,
+            min_incident_offset_lag=self.settings.min_incident_offset_lag,
+            min_incident_time_lag_sec=self.settings.min_incident_time_lag_sec,
+            min_stalled_offset_lag=self.settings.min_stalled_offset_lag,
+            min_stalled_time_lag_sec=self.settings.min_stalled_time_lag_sec,
+            min_lag_spike_delta=self.settings.min_lag_spike_delta,
+            slow_consumer_efficiency_threshold=self.settings.slow_consumer_efficiency_threshold,
         )
         final_anomaly, updated_decision_state, transition_pending = self._apply_hysteresis(
             decision_state=(
@@ -244,6 +310,16 @@ class MonitorEngine:
                 recent_producer_rates=recent_producer_rates[-self.settings.rate_window_size :],
                 lag_velocity=lag_velocity,
                 last_time_lag_sec=time_lag_sec,
+                last_backlog_growth_rate=backlog_growth_rate,
+                last_lag_spike_at=(
+                    snapshot.observed_at
+                    if spike_signal_active or anomaly.name == "lag_spike"
+                    else (
+                        previous_state.last_lag_spike_at
+                        if previous_state is not None
+                        else None
+                    )
+                ),
                 decision_state=updated_decision_state,
             ),
         )
@@ -292,6 +368,9 @@ class MonitorEngine:
                 "timestamp_sampling_state": snapshot.timestamp_sampling_state,
                 "timestamp_sampled_at": snapshot.timestamp_sampled_at,
                 "cold_start": cold_start,
+                "spike_signal_active": spike_signal_active,
+                "recent_lag_spike_active": recent_lag_spike_active,
+                "backlog_growth_rate_improving": backlog_growth_rate_improving,
                 "catching_up": catching_up,
                 "lag_decreasing": lag_decreasing,
                 "producer_rate": producer_rate,
@@ -329,6 +408,14 @@ class MonitorEngine:
             default=None,
         )
         observed_group_anomaly = worst_event.anomaly or "normal"
+
+        # If backlog is overwhelmingly concentrated in a small minority of partitions,
+        # surface that distribution truth at the group level.
+        skew_metrics = self._detect_partition_skew(partition_events)
+        if skew_metrics is not None:
+            observed_priority = ANOMALY_PRIORITY.get(observed_group_anomaly, 0)
+            if observed_priority < ANOMALY_PRIORITY.get("partition_skew", 0):
+                observed_group_anomaly = "partition_skew"
         final_group_anomaly, updated_group_decision_state, transition_pending = self._apply_hysteresis(
             decision_state=self.group_decision_state,
             observed_anomaly=observed_group_anomaly,
@@ -421,8 +508,36 @@ class MonitorEngine:
                     }
                     for event in partition_events
                 ],
+                **({"partition_skew": True, **skew_metrics} if skew_metrics is not None else {}),
             },
         )
+
+    def _detect_partition_skew(self, partition_events: list[IncidentEvent]) -> dict[str, object] | None:
+        if len(partition_events) < 2:
+            return None
+
+        lags = [max(int(event.offset_lag or 0), 0) for event in partition_events]
+        total_lag = sum(lags)
+        if total_lag < self.settings.partition_skew_min_total_lag:
+            return None
+
+        nonzero_count = sum(1 for lag in lags if lag > 0)
+        if nonzero_count == 0 or nonzero_count > self.settings.partition_skew_max_hot_partitions:
+            return None
+
+        max_lag = max(lags)
+        max_share = (max_lag / total_lag) if total_lag > 0 else 0.0
+        if max_share < float(self.settings.partition_skew_min_share):
+            return None
+
+        hotspots = sorted({event.partition for event in partition_events if (event.offset_lag or 0) == max_lag})
+        return {
+            "total_offset_lag": total_lag,
+            "max_partition_lag": max_lag,
+            "nonzero_lag_partitions": nonzero_count,
+            "max_lag_share": max_share,
+            "hot_partitions": hotspots,
+        }
 
     def _apply_partition_skew(self, partition_events: list[IncidentEvent]) -> list[IncidentEvent]:
         if len(partition_events) < 2:

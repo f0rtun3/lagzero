@@ -366,7 +366,7 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
                 topic="orders",
                 partition=0,
                 committed_offset=100,
-                latest_offset=120,
+                latest_offset=130,
                 observed_at=200.0,
                 timestamp_sampling_state="sampling_failed",
             ),
@@ -390,6 +390,47 @@ def test_prunes_old_correlation_events_from_ring_buffer() -> None:
     events = engine.run_once()
 
     assert [match["event_type"] for match in events[0].correlations] == ["error"]
+
+
+def test_spike_signal_starts_burst_grace_even_if_pressure_wins_priority() -> None:
+    settings = Settings(
+        bootstrap_servers="localhost:9092",
+        consumer_group="payments",
+        topics=["orders"],
+        state_transition_confirmations=1,
+    )
+    fetcher = FakeOffsetFetcher(
+        snapshots=[
+            PartitionOffsets(
+                topic="orders",
+                partition=0,
+                committed_offset=100,
+                latest_offset=200,
+                observed_at=20.0,
+                timestamp_sampling_state="sampling_failed",
+            ),
+        ]
+    )
+    emitter = CollectingEmitter()
+    engine = MonitorEngine(settings=settings, offset_fetcher=fetcher, event_emitter=emitter)
+    engine.state_store.set(
+        ("orders", 0),
+        PartitionState(
+            committed_offset=90,
+            latest_offset=120,
+            observed_at=10.0,
+            offset_lag=30,
+            recent_rates=[1.0],
+            recent_producer_rates=[1.0],
+        ),
+    )
+
+    events = engine.run_once()
+    state = engine.state_store.get(("orders", 0))
+
+    assert events[1].anomaly == "system_under_pressure"
+    assert state is not None
+    assert state.last_lag_spike_at == 20.0
 
 
 def test_hysteresis_requires_confirmation_before_state_transition() -> None:

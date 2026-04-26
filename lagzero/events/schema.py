@@ -30,6 +30,7 @@ class IncidentEvent:
     correlations: list[dict[str, Any]] = field(default_factory=list)
     primary_cause: str | None = None
     primary_cause_confidence: float | None = None
+    ai_explanation: dict[str, Any] | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:

@@ -8,7 +8,6 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY lagzero ./lagzero
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[kafka]"
 
 CMD ["python", "-m", "lagzero.main"]
-

@@ -29,6 +29,7 @@ dev = ["pytest>=8.0.0,<9.0.0"]
 
 [project.scripts]
 lagzero = "lagzero.main:main"
+lagzero-lab = "lagzero.lab.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -39,4 +40,3 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["lagzero*"]
-

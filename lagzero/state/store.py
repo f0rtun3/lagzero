@@ -25,6 +25,8 @@ class PartitionState:
     recent_producer_rates: list[float] = field(default_factory=list)
     lag_velocity: float | None = None
     last_time_lag_sec: float | None = None
+    last_backlog_growth_rate: float | None = None
+    last_lag_spike_at: float | None = None
     decision_state: DecisionState = field(default_factory=DecisionState)
 
 

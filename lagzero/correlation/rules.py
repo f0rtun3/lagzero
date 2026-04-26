@@ -31,11 +31,7 @@ def apply_rules(
         if time_diff_sec < 0:
             continue
 
-        if event.event_type == "deploy" and incident.anomaly in {
-            "lag_spike",
-            "system_under_pressure",
-            "catching_up",
-        }:
+        if event.event_type == "deploy" and incident.anomaly not in {None, "normal"}:
             if time_diff_sec <= deploy_window_sec and _scope_matches(incident, event):
                 candidates.append(
                     RuleCandidate(
@@ -98,4 +94,3 @@ def _scope_matches(incident: IncidentEvent, event: ExternalEvent) -> bool:
             return True
         return event.partition == incident.partition
     return False
-

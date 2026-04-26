@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 import urllib.request
 from typing import Protocol
 
@@ -16,8 +17,18 @@ class EventEmitter(Protocol):
 
 
 class StdoutEventEmitter:
+    def __init__(self, capture_path: str | None = None) -> None:
+        self._capture_path = Path(capture_path) if capture_path else None
+        if self._capture_path is not None:
+            self._capture_path.parent.mkdir(parents=True, exist_ok=True)
+
     def emit(self, event: IncidentEvent) -> None:
-        print(json.dumps(event.to_dict(), sort_keys=True))
+        payload = json.dumps(event.to_dict(), sort_keys=True)
+        print(payload)
+        if self._capture_path is not None:
+            with self._capture_path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.write("\n")
 
 
 class SlackEventEmitter:

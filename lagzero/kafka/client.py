@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_consumer(bootstrap_servers: str, consumer_group: str) -> Any:
+def build_consumer(bootstrap_servers: str, consumer_group: str | None) -> Any:
     from kafka import KafkaConsumer
 
     return KafkaConsumer(

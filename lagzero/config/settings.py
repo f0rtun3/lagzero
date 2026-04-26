@@ -35,6 +35,17 @@ class Settings:
     stalled_intervals: int = 2
     idle_intervals: int = 3
     rate_window_size: int = 3
+    min_incident_offset_lag: int = 25
+    min_incident_time_lag_sec: float = 15.0
+    min_stalled_offset_lag: int = 50
+    min_stalled_time_lag_sec: float = 30.0
+    min_lag_spike_delta: int = 25
+    slow_consumer_efficiency_threshold: float = 0.8
+    catching_up_efficiency_threshold: float = 1.0
+    burst_grace_sec: float = 20.0
+    partition_skew_min_total_lag: int = 100
+    partition_skew_max_hot_partitions: int = 1
+    partition_skew_min_share: float = 0.8
     timestamp_sample_interval_sec: float = 30.0
     lag_divergence_threshold_sec: float = 120.0
     state_transition_confirmations: int = 2
@@ -44,6 +55,18 @@ class Settings:
     rebalance_window_sec: float = 90.0
     infra_window_sec: float = 300.0
     max_correlations: int = 3
+    ai_enabled: bool = False
+    ai_provider: str = "openai"
+    ai_model: str = "gpt-5-mini"
+    ai_max_tokens: int = 400
+    ai_temperature: float = 0.1
+    ai_cache_ttl_sec: float = 120.0
+    event_log_path: str | None = None
+    ingest_enabled: bool = False
+    ingest_host: str = "127.0.0.1"
+    ingest_port: int = 8787
+    ingest_path: str = "/events"
+    ingest_request_timeout_sec: float = 5.0
     slack_webhook_url: str | None = None
     correlation_window_sec: float = 900.0
 
@@ -71,6 +94,39 @@ class Settings:
             stalled_intervals=_parse_optional_int(os.getenv("LAGZERO_STALLED_INTERVALS"), 2),
             idle_intervals=_parse_optional_int(os.getenv("LAGZERO_IDLE_INTERVALS"), 3),
             rate_window_size=_parse_optional_int(os.getenv("LAGZERO_RATE_WINDOW_SIZE"), 3),
+            min_incident_offset_lag=_parse_optional_int(
+                os.getenv("LAGZERO_MIN_INCIDENT_OFFSET_LAG"), 25
+            ),
+            min_incident_time_lag_sec=_parse_optional_float(
+                os.getenv("LAGZERO_MIN_INCIDENT_TIME_LAG_SEC"), 15.0
+            ),
+            min_stalled_offset_lag=_parse_optional_int(
+                os.getenv("LAGZERO_MIN_STALLED_OFFSET_LAG"), 50
+            ),
+            min_stalled_time_lag_sec=_parse_optional_float(
+                os.getenv("LAGZERO_MIN_STALLED_TIME_LAG_SEC"), 30.0
+            ),
+            min_lag_spike_delta=_parse_optional_int(
+                os.getenv("LAGZERO_MIN_LAG_SPIKE_DELTA"), 25
+            ),
+            slow_consumer_efficiency_threshold=_parse_optional_float(
+                os.getenv("LAGZERO_SLOW_CONSUMER_EFFICIENCY_THRESHOLD"), 0.8
+            ),
+            catching_up_efficiency_threshold=_parse_optional_float(
+                os.getenv("LAGZERO_CATCHING_UP_EFFICIENCY_THRESHOLD"), 1.0
+            ),
+            burst_grace_sec=_parse_optional_float(
+                os.getenv("LAGZERO_BURST_GRACE_SEC"), 20.0
+            ),
+            partition_skew_min_total_lag=_parse_optional_int(
+                os.getenv("LAGZERO_PARTITION_SKEW_MIN_TOTAL_LAG"), 100
+            ),
+            partition_skew_max_hot_partitions=_parse_optional_int(
+                os.getenv("LAGZERO_PARTITION_SKEW_MAX_HOT_PARTITIONS"), 1
+            ),
+            partition_skew_min_share=_parse_optional_float(
+                os.getenv("LAGZERO_PARTITION_SKEW_MIN_SHARE"), 0.8
+            ),
             timestamp_sample_interval_sec=_parse_optional_float(
                 os.getenv("LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC"), 30.0
             ),
@@ -97,6 +153,23 @@ class Settings:
             ),
             max_correlations=_parse_optional_int(
                 os.getenv("LAGZERO_MAX_CORRELATIONS"), 3
+            ),
+            ai_enabled=os.getenv("LAGZERO_AI_ENABLED", "false").strip().lower() == "true",
+            ai_provider=os.getenv("LAGZERO_AI_PROVIDER", "openai").strip().lower() or "openai",
+            ai_model=os.getenv("LAGZERO_AI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+            ai_max_tokens=_parse_optional_int(os.getenv("LAGZERO_AI_MAX_TOKENS"), 400),
+            ai_temperature=_parse_optional_float(os.getenv("LAGZERO_AI_TEMPERATURE"), 0.1),
+            ai_cache_ttl_sec=_parse_optional_float(
+                os.getenv("LAGZERO_AI_CACHE_TTL_SEC"), 120.0
+            ),
+            event_log_path=os.getenv("LAGZERO_EVENT_LOG_PATH") or None,
+            ingest_enabled=os.getenv("LAGZERO_INGEST_ENABLED", "false").strip().lower()
+            == "true",
+            ingest_host=os.getenv("LAGZERO_INGEST_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            ingest_port=_parse_optional_int(os.getenv("LAGZERO_INGEST_PORT"), 8787),
+            ingest_path=os.getenv("LAGZERO_INGEST_PATH", "/events").strip() or "/events",
+            ingest_request_timeout_sec=_parse_optional_float(
+                os.getenv("LAGZERO_INGEST_REQUEST_TIMEOUT_SEC"), 5.0
             ),
             slack_webhook_url=os.getenv("LAGZERO_SLACK_WEBHOOK_URL") or None,
             correlation_window_sec=_parse_optional_float(

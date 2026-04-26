@@ -127,6 +127,9 @@ stdout / Slack
 - Explicit consumer-group service health: `healthy`, `degraded`, `failing`, `recovering`
 - In-memory correlation window for recent operational events
 - Deterministic correlation engine with primary-cause selection
+- Public `lagzero ingest ...` CLI for deploy, error, infra, and rebalance events
+- Grounded AI explanation layer for stable incidents
+- Local Kafka chaos lab with JSONL artifact capture and smoke scenarios
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
 
@@ -139,9 +142,13 @@ lagzero/
 ├── .env.example
 ├── lagzero/
 │   ├── config/
+│   ├── ai/
+│   ├── correlation/
 │   ├── engine/
 │   ├── events/
+│   ├── ingest/
 │   ├── kafka/
+│   ├── lab/
 │   ├── monitoring/
 │   ├── state/
 │   └── main.py
@@ -185,6 +192,16 @@ Or:
 python -m lagzero.main
 ```
 
+### 4. Ingest external events
+
+```bash
+lagzero ingest deploy \
+  --service orders-service \
+  --consumer-group payments-consumer \
+  --topic orders \
+  --metadata version=v1.2.3
+```
+
 ## Docker
 
 Build and run LagZero in a container:
@@ -198,7 +215,7 @@ docker run --rm \
   lagzero
 ```
 
-For a local demo stack with Kafka included:
+For the local Kafka chaos lab stack:
 
 ```bash
 docker compose up --build
@@ -206,9 +223,54 @@ docker compose up --build
 
 This starts:
 
-- `zookeeper`
 - `kafka`
 - `lagzero`
+- `consumer-runner`
+
+The stack uses a pinned Kafka `4.0.0` KRaft image (`bitnamilegacy/kafka:4.0.0-debian-12-r10`) and exposes a local ingest endpoint on `http://127.0.0.1:8787/events`.
+
+Run the smoke subset of chaos scenarios with:
+
+```bash
+./scripts/run_chaos_smoke.sh
+```
+
+Run an individual scenario with:
+
+```bash
+./scripts/run_chaos_lab.sh scenario burst_spike
+```
+
+Each scenario now writes:
+
+- `incidents.jsonl`: raw emitted incident stream
+- `contract-report.json`: pass/fail decision plus final incident evidence
+
+The smoke suite also writes:
+
+- `smoke-summary.json`: one structured verdict per smoke scenario
+
+The chaos lab validates scenario contracts against the full artifact, not an exact transition sequence. That makes it more resilient to future decision-layer tuning while still failing on semantic regressions such as:
+
+- healthy baseline ending in `consumer_stalled`
+- burst scenarios stabilizing as severe failure without justification
+- sustained pressure never reaching a severe path
+- missing or incorrect deploy/error primary causes
+
+The full local chaos suite now has contract coverage for:
+
+- `baseline_healthy_lag`
+- `burst_spike`
+- `sustained_pressure`
+- `consumer_freeze`
+- `idle_but_delayed`
+- `offset_reset`
+- `rebalance_noise`
+- `partition_skew`
+- `deploy_correlation`
+- `error_correlation`
+
+At the time of the latest README update, all of those scenarios have passing local contract artifacts.
 
 ## Configuration
 
@@ -223,9 +285,17 @@ LagZero is configured through environment variables:
 | `LAGZERO_EMITTER` | `stdout` or `slack` | `stdout` |
 | `LAGZERO_LOG_LEVEL` | Logging level | `INFO` |
 | `LAGZERO_LAG_SPIKE_MULTIPLIER` | Spike threshold vs previous lag | `2.0` |
+| `LAGZERO_MIN_INCIDENT_OFFSET_LAG` | Minimum offset lag before warning-level incident classes are eligible | `25` |
+| `LAGZERO_MIN_INCIDENT_TIME_LAG_SEC` | Minimum time lag before warning-level incident classes are eligible | `15` |
+| `LAGZERO_MIN_STALLED_OFFSET_LAG` | Minimum offset lag before `consumer_stalled` is eligible | `50` |
+| `LAGZERO_MIN_STALLED_TIME_LAG_SEC` | Minimum time lag before `consumer_stalled` is eligible | `30` |
+| `LAGZERO_MIN_LAG_SPIKE_DELTA` | Minimum absolute lag jump required for `lag_spike` | `25` |
 | `LAGZERO_STALLED_INTERVALS` | Consecutive zero-rate intervals before stalled | `2` |
 | `LAGZERO_IDLE_INTERVALS` | Consecutive no-movement intervals before idle detection | `3` |
 | `LAGZERO_RATE_WINDOW_SIZE` | Number of intervals used for rate smoothing | `3` |
+| `LAGZERO_SLOW_CONSUMER_EFFICIENCY_THRESHOLD` | Efficiency threshold below which positive but insufficient progress is treated as `slow_consumer` | `0.8` |
+| `LAGZERO_CATCHING_UP_EFFICIENCY_THRESHOLD` | Efficiency threshold that can help recovery states qualify as `catching_up` | `1.0` |
+| `LAGZERO_BURST_GRACE_SEC` | Short grace window after a lag spike that helps burst recovery avoid premature `consumer_stalled` classification | `20` |
 | `LAGZERO_TIMESTAMP_SAMPLE_INTERVAL_SEC` | Minimum interval between timestamp sampling attempts per partition | `30` |
 | `LAGZERO_LAG_DIVERGENCE_THRESHOLD_SEC` | Threshold for flagging measured vs estimated lag mismatch | `120` |
 | `LAGZERO_STATE_TRANSITION_CONFIRMATIONS` | Consecutive confirmations required before a new state becomes stable | `2` |
@@ -235,6 +305,18 @@ LagZero is configured through environment variables:
 | `LAGZERO_REBALANCE_WINDOW_SEC` | Matching window for rebalance correlation | `90` |
 | `LAGZERO_INFRA_WINDOW_SEC` | Matching window for infrastructure correlation | `300` |
 | `LAGZERO_MAX_CORRELATIONS` | Maximum matches attached to an incident | `3` |
+| `LAGZERO_AI_ENABLED` | Enable grounded AI explanations for stable incidents | `false` |
+| `LAGZERO_AI_PROVIDER` | AI provider identifier | `openai` |
+| `LAGZERO_AI_MODEL` | Model used for incident explanations | `gpt-5-mini` |
+| `LAGZERO_AI_MAX_TOKENS` | Maximum explanation output tokens | `400` |
+| `LAGZERO_AI_TEMPERATURE` | Explanation sampling temperature | `0.1` |
+| `LAGZERO_AI_CACHE_TTL_SEC` | Cache TTL for repeated equivalent incidents | `120` |
+| `LAGZERO_EVENT_LOG_PATH` | Optional JSONL capture file for emitted incidents | empty |
+| `LAGZERO_INGEST_ENABLED` | Enable the local ingest HTTP server | `false` |
+| `LAGZERO_INGEST_HOST` | Bind host for the ingest HTTP server | `127.0.0.1` |
+| `LAGZERO_INGEST_PORT` | Port for the ingest HTTP server | `8787` |
+| `LAGZERO_INGEST_PATH` | HTTP path for event ingestion | `/events` |
+| `LAGZERO_INGEST_REQUEST_TIMEOUT_SEC` | CLI timeout for ingest requests | `5` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -257,7 +339,8 @@ For each topic partition, the engine:
 14. Detects partition skew from cross-partition lag imbalance.
 15. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
 16. Runs deterministic correlation against recent external events.
-17. Emits enriched incident events.
+17. Builds a grounded explanation for stable incidents when AI is enabled.
+18. Emits enriched incident events.
 
 Timestamp correction works like this:
 
@@ -310,10 +393,19 @@ Confidence is rule-based rather than opaque:
 
 ## External Correlation Events
 
-LagZero includes a simple ingestion hook for external operational context:
+LagZero includes both an in-process ingestion hook and a public CLI for external operational context:
 
 ```python
 engine.add_external_event(event_type="deploy", timestamp=time.time())
+```
+
+```bash
+lagzero ingest error \
+  --service orders-service \
+  --consumer-group payments-consumer \
+  --topic orders \
+  --severity error \
+  --metadata error_type=deserialization_failure
 ```
 
 Recent external events are retained in an in-memory time window and attached to emitted incidents as correlation context. This keeps correlation grounded in a defined MVP interface instead of leaving it as a placeholder concept.
@@ -325,6 +417,25 @@ The correlation engine:
 3. Applies deterministic rules such as `deploy_within_window`, `error_nearby`, `rebalance_overlap`, and `infra_change_nearby`.
 4. Scores matches by time proximity, scope match, and rule relevance.
 5. Selects a `primary_cause` and keeps the next strongest matches as supporting evidence.
+
+## AI Explanation Layer
+
+The AI layer runs after detection, stabilization, and correlation. It explains incidents; it does not detect them.
+
+It:
+
+- consumes only final stable incident fields
+- uses anomaly, health, lag metrics, primary cause, and supporting correlations as evidence
+- returns structured output with `summary`, `probable_cause_explanation`, `impact`, `recommended_actions`, and `caveats`
+- caches explanations for repeated equivalent incidents within a short TTL
+- fails safely without blocking deterministic incident emission
+
+It does not:
+
+- change anomaly classification
+- override service health
+- invent causes outside the structured evidence
+- suppress deterministic incident output
 
 ## Slack Output
 
@@ -352,6 +463,15 @@ The tests cover the core pure logic:
 - group event aggregation and service health
 - producer pressure, partition skew, and correlation retention
 - correlation rule matching, scoring, and primary-cause selection
+- AI context building, prompt grounding, caching, and fallback parsing
+- ingest CLI transport and JSONL incident capture helpers
+
+For the Docker-backed chaos lab, the smoke subset currently covers:
+
+- healthy bounded lag
+- burst-induced lag spike
+- sustained pressure
+- deploy correlation
 
 ## Design Principles
 
@@ -362,13 +482,25 @@ The tests cover the core pure logic:
 
 ## Roadmap
 
-- Rich correlation with deploys, errors, and infra signals
-- AI-generated root-cause explanations
+Completed in the current foundation:
+
+- Kafka-first lag monitoring with group-level incident synthesis
+- Smoothed producer/consumer rates, backlog growth, lag velocity, and consumer efficiency
+- Timestamp-based lag correction with timestamp semantics and divergence diagnostics
+- Deterministic anomaly resolution with hysteresis and explicit service health
+- Correlation engine with deploy, error, infra, and rebalance evidence
+- Public `lagzero ingest ...` CLI and local HTTP ingest endpoint
+- Grounded AI explanation layer for stable incidents
+- Docker-backed local chaos lab with contract-based scenario validation
+
+Next:
+
 - Incident lifecycle and stateful incident tracking
-- Kafka incident timelines
+- Incident timelines built from stable transitions and correlated evidence
 - More sinks: PagerDuty, Kafka topics, webhooks
+- Persistent event/correlation storage beyond in-memory retention
 - More backends: SQS, Pub/Sub, and beyond
 
 ## Status
 
-LagZero is currently an MVP foundation focused on Kafka consumer lag intelligence. It is intentionally narrow so the core event model, detection logic, and incident schema can harden before broader platform expansion.
+LagZero is now a working Kafka incident-intelligence foundation with deterministic detection, correlation, grounded explanation, and a local chaos lab that validates the core incident scenarios end to end. The next step is not more raw signal collection; it is turning stable incidents into first-class lifecycle objects so operators can reason about open, changing, and resolved incidents over time.
