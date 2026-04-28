@@ -15,6 +15,7 @@ from lagzero.correlation.store import CorrelationEventStore
 from lagzero.config.settings import Settings
 from lagzero.events.emitter import EventEmitter
 from lagzero.events.schema import IncidentEvent
+from lagzero.incidents.manager import IncidentLifecycleManager
 from lagzero.kafka.offsets import OffsetFetcher, PartitionOffsets
 from lagzero.monitoring.anomaly import (
     ANOMALY_PRIORITY,
@@ -26,6 +27,9 @@ from lagzero.monitoring.lag_calculator import compute_lag
 from lagzero.monitoring.lag_velocity import compute_lag_velocity
 from lagzero.monitoring.rate_calculator import compute_rate, rate_variance_high, smooth_rate
 from lagzero.monitoring.time_lag import compute_time_lag
+from lagzero.persistence.repository import IncidentRepository
+from lagzero.persistence.sqlite import SQLiteIncidentStore
+from lagzero.sinks.webhook import WebhookSink
 from lagzero.state.store import DecisionState, InMemoryStateStore, PartitionState
 
 logger = logging.getLogger(__name__)
@@ -40,6 +44,7 @@ class MonitorEngine:
     correlation_store: CorrelationEventStore | None = None
     correlation_engine: CorrelationEngine | None = None
     incident_explainer: IncidentExplainer | None = None
+    incident_lifecycle_manager: IncidentLifecycleManager | None = None
     group_decision_state: DecisionState = field(default_factory=DecisionState)
 
     def __post_init__(self) -> None:
@@ -61,6 +66,41 @@ class MonitorEngine:
                 llm_client=DisabledLLMClient(),
                 enabled=self.settings.ai_enabled,
                 cache_ttl_sec=self.settings.ai_cache_ttl_sec,
+            )
+        if self.incident_lifecycle_manager is None:
+            repository: IncidentRepository | None = None
+            if self.settings.incidents_enabled:
+                if self.settings.persistence_backend != "sqlite":
+                    raise ValueError(
+                        f"Unsupported persistence backend '{self.settings.persistence_backend}'."
+                    )
+                repository = IncidentRepository(
+                    SQLiteIncidentStore(self.settings.sqlite_path)
+                )
+
+            webhook_sink: WebhookSink | None = None
+            if self.settings.webhook_enabled:
+                if not self.settings.webhook_url:
+                    raise ValueError(
+                        "LAGZERO_WEBHOOK_URL is required when LAGZERO_WEBHOOK_ENABLED=true."
+                    )
+                if not self.settings.webhook_secret:
+                    raise ValueError(
+                        "LAGZERO_WEBHOOK_SECRET is required when LAGZERO_WEBHOOK_ENABLED=true."
+                    )
+                webhook_sink = WebhookSink(
+                    url=self.settings.webhook_url,
+                    secret=self.settings.webhook_secret,
+                    timeout_sec=self.settings.webhook_timeout_sec,
+                    max_retries=self.settings.webhook_max_retries,
+                    event_version=self.settings.webhook_event_version,
+                )
+
+            self.incident_lifecycle_manager = IncidentLifecycleManager(
+                repository=repository,
+                webhook_sink=webhook_sink,
+                resolve_confirmations=self.settings.incident_resolve_confirmations,
+                enabled=self.settings.incidents_enabled,
             )
 
     def run_forever(self) -> None:
@@ -86,6 +126,8 @@ class MonitorEngine:
         events.extend(partition_events)
         events = [self.correlation_engine.enrich(event) for event in events]
         events = [self.incident_explainer.explain(event) for event in events]
+        for event in events:
+            self.incident_lifecycle_manager.handle_stable_incident(event)
 
         for event in events:
             self.event_emitter.emit(event)

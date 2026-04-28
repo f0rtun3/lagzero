@@ -24,6 +24,8 @@ The current MVP monitors a Kafka consumer group and emits per-partition incident
 - Basic anomaly classification
 - Explicit handling for offset resets, cold-start catch-up, and partition skew
 - Optional correlation metadata from external events like deploys
+- Stable incident lifecycle transitions with timeline entries
+- Optional signed webhook delivery for downstream automation
 
 Example output:
 
@@ -103,9 +105,13 @@ Time Lag Estimator
    ↓
 Anomaly Detector
    ↓
-Event Emitter
+Correlation Engine
    ↓
-stdout / Slack
+AI Explanation Layer
+   ↓
+Incident Lifecycle Manager
+   ↓
+Webhook Sink / stdout / Slack / SQLite persistence
 ```
 
 ## Features
@@ -129,6 +135,10 @@ stdout / Slack
 - Deterministic correlation engine with primary-cause selection
 - Public `lagzero ingest ...` CLI for deploy, error, infra, and rebalance events
 - Grounded AI explanation layer for stable incidents
+- Stateful incident lifecycle with open, update, and resolve events
+- Timeline entries persisted for incident history
+- Signed webhook output with bounded retry behavior
+- SQLite-backed incident and timeline persistence
 - Local Kafka chaos lab with JSONL artifact capture and smoke scenarios
 - Structured incident event schema for downstream automation
 - Pure monitoring functions with focused unit tests
@@ -146,10 +156,13 @@ lagzero/
 │   ├── correlation/
 │   ├── engine/
 │   ├── events/
+│   ├── incidents/
 │   ├── ingest/
 │   ├── kafka/
 │   ├── lab/
 │   ├── monitoring/
+│   ├── persistence/
+│   ├── sinks/
 │   ├── state/
 │   └── main.py
 ├── tests/
@@ -311,6 +324,16 @@ LagZero is configured through environment variables:
 | `LAGZERO_AI_MAX_TOKENS` | Maximum explanation output tokens | `400` |
 | `LAGZERO_AI_TEMPERATURE` | Explanation sampling temperature | `0.1` |
 | `LAGZERO_AI_CACHE_TTL_SEC` | Cache TTL for repeated equivalent incidents | `120` |
+| `LAGZERO_INCIDENTS_ENABLED` | Enable stateful incident lifecycle tracking | `true` |
+| `LAGZERO_INCIDENT_RESOLVE_CONFIRMATIONS` | Consecutive healthy stable polls required before resolving an incident | `2` |
+| `LAGZERO_WEBHOOK_ENABLED` | Enable signed lifecycle webhook delivery | `false` |
+| `LAGZERO_WEBHOOK_URL` | Destination URL for lifecycle webhook delivery | empty |
+| `LAGZERO_WEBHOOK_TIMEOUT_SEC` | Webhook request timeout in seconds | `5` |
+| `LAGZERO_WEBHOOK_MAX_RETRIES` | Maximum bounded retries for transient webhook failures | `3` |
+| `LAGZERO_WEBHOOK_SECRET` | HMAC secret used to sign webhook payloads | empty |
+| `LAGZERO_WEBHOOK_EVENT_VERSION` | Outbound lifecycle webhook schema version | `1.0` |
+| `LAGZERO_PERSISTENCE_BACKEND` | Persistence backend identifier | `sqlite` |
+| `LAGZERO_SQLITE_PATH` | SQLite database path for incidents and timeline history | `.chaos/lagzero.db` |
 | `LAGZERO_EVENT_LOG_PATH` | Optional JSONL capture file for emitted incidents | empty |
 | `LAGZERO_INGEST_ENABLED` | Enable the local ingest HTTP server | `false` |
 | `LAGZERO_INGEST_HOST` | Bind host for the ingest HTTP server | `127.0.0.1` |
@@ -340,7 +363,9 @@ For each topic partition, the engine:
 15. Synthesizes a consumer-group incident using worst-case stable anomaly truth and explicit service-health rules.
 16. Runs deterministic correlation against recent external events.
 17. Builds a grounded explanation for stable incidents when AI is enabled.
-18. Emits enriched incident events.
+18. Tracks stable incidents through open, update, and resolve lifecycle transitions.
+19. Persists incident and timeline history and emits lifecycle webhooks when configured.
+20. Emits enriched incident snapshot events through the selected emitter.
 
 Timestamp correction works like this:
 
@@ -437,6 +462,96 @@ It does not:
 - invent causes outside the structured evidence
 - suppress deterministic incident output
 
+## Incident Lifecycle
+
+LagZero now turns stable enriched incidents into durable lifecycle objects.
+
+Supported lifecycle events:
+
+- `incident.opened`
+- `incident.updated`
+- `incident.resolved`
+
+Lifecycle continuity is deterministic:
+
+- anomalies are mapped into incident families such as `pressure`, `stall`, `delay`, `rebalance`, `topology`, and `operator_action`
+- a stable incident key is derived from scope, consumer group, topic or partition when relevant, and family
+- related anomaly transitions such as `lag_spike -> system_under_pressure` stay inside one logical incident
+- healthy stable snapshots resolve active incidents only after `LAGZERO_INCIDENT_RESOLVE_CONFIRMATIONS`
+
+Material-change filtering keeps lifecycle output low-noise. LagZero emits `incident.updated` only when stable incident meaning changes, such as:
+
+- anomaly
+- service health
+- severity
+- primary cause
+- primary-cause confidence bucket
+- lag bucket
+- explanation fingerprint
+- meaningful supporting correlations
+
+Each lifecycle change creates a timeline entry that is persisted alongside the active incident record.
+
+## Signed Webhook Output
+
+LagZero can deliver lifecycle events to downstream systems as signed JSON webhooks.
+
+Enable it with:
+
+```bash
+export LAGZERO_WEBHOOK_ENABLED=true
+export LAGZERO_WEBHOOK_URL=https://example.com/lagzero/webhooks
+export LAGZERO_WEBHOOK_SECRET=replace-me
+```
+
+Webhook delivery behavior:
+
+- `POST` with `application/json`
+- timeout default: `5s`
+- bounded retries with exponential backoff
+- transport failures do not block detection or lifecycle persistence
+
+Every lifecycle webhook includes:
+
+- `event_id`
+- `event_type`
+- `event_version`
+- `timestamp`
+- `source`
+- stable `incident` object
+- one `timeline_entry`
+- latest `current_state`
+
+Security headers:
+
+- `X-LagZero-Event`
+- `X-LagZero-Event-Id`
+- `X-LagZero-Timestamp`
+- `X-LagZero-Signature`
+
+The signature is `HMAC-SHA256` over:
+
+```text
+<timestamp>.<raw_body>
+```
+
+This keeps outbound automation idempotent and verifiable without letting the sink influence detection logic.
+
+## Persistence
+
+For launch, LagZero persists lifecycle state in SQLite.
+
+It stores:
+
+- active and resolved incident records
+- incident timeline entries
+
+This gives operators and downstream systems a durable history of:
+
+- when an incident opened
+- how it changed
+- when it resolved
+
 ## Slack Output
 
 Set:
@@ -464,6 +579,8 @@ The tests cover the core pure logic:
 - producer pressure, partition skew, and correlation retention
 - correlation rule matching, scoring, and primary-cause selection
 - AI context building, prompt grounding, caching, and fallback parsing
+- incident family mapping, key derivation, lifecycle open-update-resolve behavior, and SQLite persistence
+- signed webhook envelope construction and bounded retry behavior
 - ingest CLI transport and JSONL incident capture helpers
 
 For the Docker-backed chaos lab, the smoke subset currently covers:
@@ -491,16 +608,26 @@ Completed in the current foundation:
 - Correlation engine with deploy, error, infra, and rebalance evidence
 - Public `lagzero ingest ...` CLI and local HTTP ingest endpoint
 - Grounded AI explanation layer for stable incidents
+- Stateful incident lifecycle with deterministic family continuity
+- Timeline entries and SQLite-backed incident history
+- Signed, idempotent webhook output for lifecycle automation
 - Docker-backed local chaos lab with contract-based scenario validation
 
 Next:
 
-- Incident lifecycle and stateful incident tracking
-- Incident timelines built from stable transitions and correlated evidence
-- More sinks: PagerDuty, Kafka topics, webhooks
+- Operator-facing incident timeline views and history queries
+- Delivery durability improvements such as webhook redelivery tracking
+- Hardening lifecycle persistence and incident history workflows for launch validation
+
+Post-validation:
+
+- More sinks: PagerDuty and Kafka-topic delivery
 - Persistent event/correlation storage beyond in-memory retention
 - More backends: SQS, Pub/Sub, and beyond
+- Multiple persistence backends
+- Richer AI and more complex UI surfaces
+- Multi-tenant SaaS shaping
 
 ## Status
 
-LagZero is now a working Kafka incident-intelligence foundation with deterministic detection, correlation, grounded explanation, and a local chaos lab that validates the core incident scenarios end to end. The next step is not more raw signal collection; it is turning stable incidents into first-class lifecycle objects so operators can reason about open, changing, and resolved incidents over time.
+LagZero is now a working Kafka incident-intelligence foundation with deterministic detection, correlation, grounded explanation, durable incident lifecycle tracking, signed webhook output, and a local chaos lab that validates the core incident scenarios end to end. Before launch, the focus stays narrow: harden lifecycle behavior, make incident history easy to inspect, and validate the current Kafka-first workflow in real use. Broader sinks, new backends, richer AI, and larger product surface area stay intentionally out of scope until after validation.

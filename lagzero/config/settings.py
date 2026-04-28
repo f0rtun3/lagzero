@@ -61,6 +61,16 @@ class Settings:
     ai_max_tokens: int = 400
     ai_temperature: float = 0.1
     ai_cache_ttl_sec: float = 120.0
+    incidents_enabled: bool = False
+    incident_resolve_confirmations: int = 2
+    webhook_enabled: bool = False
+    webhook_url: str | None = None
+    webhook_timeout_sec: float = 5.0
+    webhook_max_retries: int = 3
+    webhook_secret: str | None = None
+    webhook_event_version: str = "1.0"
+    persistence_backend: str = "sqlite"
+    sqlite_path: str = ".chaos/lagzero.db"
     event_log_path: str | None = None
     ingest_enabled: bool = False
     ingest_host: str = "127.0.0.1"
@@ -162,6 +172,27 @@ class Settings:
             ai_cache_ttl_sec=_parse_optional_float(
                 os.getenv("LAGZERO_AI_CACHE_TTL_SEC"), 120.0
             ),
+            incidents_enabled=os.getenv("LAGZERO_INCIDENTS_ENABLED", "false").strip().lower()
+            == "true",
+            incident_resolve_confirmations=_parse_optional_int(
+                os.getenv("LAGZERO_INCIDENT_RESOLVE_CONFIRMATIONS"), 2
+            ),
+            webhook_enabled=os.getenv("LAGZERO_WEBHOOK_ENABLED", "false").strip().lower()
+            == "true",
+            webhook_url=os.getenv("LAGZERO_WEBHOOK_URL") or None,
+            webhook_timeout_sec=_parse_optional_float(
+                os.getenv("LAGZERO_WEBHOOK_TIMEOUT_SEC"), 5.0
+            ),
+            webhook_max_retries=_parse_optional_int(
+                os.getenv("LAGZERO_WEBHOOK_MAX_RETRIES"), 3
+            ),
+            webhook_secret=os.getenv("LAGZERO_WEBHOOK_SECRET") or None,
+            webhook_event_version=os.getenv("LAGZERO_WEBHOOK_EVENT_VERSION", "1.0").strip()
+            or "1.0",
+            persistence_backend=os.getenv("LAGZERO_PERSISTENCE_BACKEND", "sqlite").strip().lower()
+            or "sqlite",
+            sqlite_path=os.getenv("LAGZERO_SQLITE_PATH", ".chaos/lagzero.db").strip()
+            or ".chaos/lagzero.db",
             event_log_path=os.getenv("LAGZERO_EVENT_LOG_PATH") or None,
             ingest_enabled=os.getenv("LAGZERO_INGEST_ENABLED", "false").strip().lower()
             == "true",
