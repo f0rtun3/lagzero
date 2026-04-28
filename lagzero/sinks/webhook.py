@@ -33,16 +33,29 @@ class WebhookSink:
 
     def emit(self, envelope: WebhookEventEnvelope) -> None:
         raw_body = json.dumps(envelope.to_dict(), sort_keys=True)
-        timestamp = envelope.timestamp
+        self.emit_serialized(
+            raw_body=raw_body,
+            event_type=envelope.event_type,
+            event_id=envelope.event_id,
+            timestamp=envelope.timestamp,
+        )
+
+    def emit_serialized(
+        self,
+        *,
+        raw_body: str,
+        event_type: str,
+        event_id: str,
+        timestamp: str,
+    ) -> None:
         signature = build_signature(self._secret, timestamp=timestamp, raw_body=raw_body)
         headers = {
             "Content-Type": "application/json",
-            "X-LagZero-Event": envelope.event_type,
-            "X-LagZero-Event-Id": envelope.event_id,
+            "X-LagZero-Event": event_type,
+            "X-LagZero-Event-Id": event_id,
             "X-LagZero-Timestamp": timestamp,
             "X-LagZero-Signature": signature,
         }
-
         def deliver() -> None:
             request = urllib.request.Request(
                 self._url,

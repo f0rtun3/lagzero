@@ -6,8 +6,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Callable
+from urllib.parse import parse_qs, urlparse
 
 from lagzero.correlation.schema import ExternalEvent
+from lagzero.incidents.service import IncidentHistoryService
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +36,17 @@ class IngestHTTPServer:
         self,
         host: str,
         port: int,
-        path: str,
-        on_event: Callable[[ExternalEvent], None],
+        path: str | None = None,
+        on_event: Callable[[ExternalEvent], None] | None = None,
+        operator_service: IncidentHistoryService | None = None,
+        operator_path_prefix: str = "/",
+        health_payload: dict[str, object] | None = None,
     ) -> None:
-        self._path = _normalize_path(path)
+        self._path = _normalize_path(path) if path is not None else None
         self._on_event = on_event
+        self._operator_service = operator_service
+        self._operator_path_prefix = _normalize_prefix(operator_path_prefix)
+        self._health_payload = health_payload or {"status": "ok"}
         handler = self._build_handler()
         self._server = ThreadingHTTPServer((host, port), handler)
         self._thread: Thread | None = None
@@ -53,10 +61,9 @@ class IngestHTTPServer:
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         logger.info(
-            "LagZero ingest HTTP server listening on %s:%s%s",
+            "LagZero local HTTP server listening on %s:%s",
             self._server.server_address[0],
             self._server.server_address[1],
-            self._path,
         )
 
     def stop(self) -> None:
@@ -70,16 +77,92 @@ class IngestHTTPServer:
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         path = self._path
         on_event = self._on_event
+        operator_service = self._operator_service
+        operator_prefix = self._operator_path_prefix
+        health_payload = self._health_payload
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                if self.path != "/health":
+                parsed = urlparse(self.path)
+                route = parsed.path
+                if route == "/health":
+                    self._send_json(HTTPStatus.OK, health_payload)
+                    return
+                if operator_service is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
-                self._send_json(HTTPStatus.OK, {"status": "ok"})
+
+                if route == _prefix_path(operator_prefix, "/incidents"):
+                    params = parse_qs(parsed.query)
+                    limit = int(params.get("limit", ["50"])[0])
+                    incidents = operator_service.list_incidents(
+                        status=params.get("status", ["all"])[0],
+                        consumer_group=params.get("consumer_group", [None])[0],
+                        family=params.get("family", [None])[0],
+                        limit=limit,
+                    )
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"items": [incident.to_dict() for incident in incidents], "total": len(incidents)},
+                    )
+                    return
+
+                if route == _prefix_path(operator_prefix, "/incident-deliveries"):
+                    params = parse_qs(parsed.query)
+                    limit = int(params.get("limit", ["50"])[0])
+                    deliveries = operator_service.list_deliveries(
+                        incident_id=params.get("incident_id", [None])[0],
+                        delivery_state=params.get("delivery_state", [None])[0],
+                        limit=limit,
+                    )
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"items": [record.to_dict() for record in deliveries], "total": len(deliveries)},
+                    )
+                    return
+
+                incident_id = _match_path(route, operator_prefix, "/incidents/")
+                if incident_id is not None and not route.endswith("/timeline"):
+                    incident = operator_service.get_incident(incident_id)
+                    if incident is None:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                        return
+                    self._send_json(HTTPStatus.OK, {"incident": incident.to_dict()})
+                    return
+
+                timeline_id = _match_path(route, operator_prefix, "/incidents/")
+                if timeline_id is not None and route.endswith("/timeline"):
+                    incident_id = timeline_id.removesuffix("/timeline")
+                    entries = operator_service.get_timeline(incident_id)
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"incident_id": incident_id, "items": [entry.to_dict() for entry in entries]},
+                    )
+                    return
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path != path:
+                parsed = urlparse(self.path)
+                route = parsed.path
+                if operator_service is not None:
+                    event_id = _match_path(route, operator_prefix, "/incident-deliveries/")
+                    if event_id is not None and route.endswith("/redeliver"):
+                        target_event_id = event_id.removesuffix("/redeliver")
+                        try:
+                            record = operator_service.redeliver_event(target_event_id)
+                        except KeyError:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                            return
+                        except RuntimeError as exc:
+                            self._send_json(
+                                HTTPStatus.BAD_REQUEST,
+                                {"error": "delivery_unavailable", "detail": str(exc)},
+                            )
+                            return
+                        self._send_json(HTTPStatus.OK, {"delivery": record.to_dict()})
+                        return
+
+                if path is None or on_event is None or route != path:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
 
@@ -119,3 +202,25 @@ def _normalize_path(path: str) -> str:
     if not cleaned.startswith("/"):
         cleaned = f"/{cleaned}"
     return cleaned
+
+
+def _normalize_prefix(prefix: str) -> str:
+    cleaned = prefix.strip() or "/"
+    if not cleaned.startswith("/"):
+        cleaned = f"/{cleaned}"
+    if cleaned != "/":
+        cleaned = cleaned.rstrip("/")
+    return cleaned
+
+
+def _prefix_path(prefix: str, suffix: str) -> str:
+    if prefix == "/":
+        return suffix
+    return f"{prefix}{suffix}"
+
+
+def _match_path(path: str, prefix: str, base: str) -> str | None:
+    full_base = _prefix_path(prefix, base)
+    if not path.startswith(full_base):
+        return None
+    return path.removeprefix(full_base)

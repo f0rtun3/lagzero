@@ -34,3 +34,19 @@ CREATE TABLE IF NOT EXISTS incident_timeline (
     details_json TEXT NOT NULL
 );
 """
+
+
+DELIVERIES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS incident_deliveries (
+    event_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    timeline_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_version TEXT NOT NULL,
+    delivery_state TEXT NOT NULL,
+    delivery_attempts INTEGER NOT NULL,
+    last_delivery_error TEXT,
+    last_delivery_at REAL,
+    payload_json TEXT NOT NULL
+);
+"""

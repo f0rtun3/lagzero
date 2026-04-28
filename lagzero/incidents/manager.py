@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 import uuid
@@ -9,7 +10,12 @@ from lagzero.events.schema import IncidentEvent
 from lagzero.incidents.families import incident_family_for_anomaly
 from lagzero.incidents.keys import build_incident_key
 from lagzero.incidents.lifecycle import material_change_types
-from lagzero.incidents.schema import IncidentRecord, LifecycleResult, WebhookEventEnvelope
+from lagzero.incidents.schema import (
+    DeliveryRecord,
+    IncidentRecord,
+    LifecycleResult,
+    WebhookEventEnvelope,
+)
 from lagzero.incidents.store import IncidentStateStore
 from lagzero.incidents.timeline import (
     build_opened_entry,
@@ -183,9 +189,10 @@ class IncidentLifecycleManager:
     ) -> bool:
         if self._webhook_sink is None:
             return False
+        event_id = str(uuid.uuid4())
         try:
             envelope = WebhookEventEnvelope(
-                event_id=str(uuid.uuid4()),
+                event_id=event_id,
                 event_type=event_type,
                 event_version=self._webhook_sink.event_version,
                 timestamp=datetime.fromtimestamp(timeline_entry.at, tz=UTC).isoformat().replace(
@@ -208,9 +215,57 @@ class IncidentLifecycleManager:
                 timeline_entry=timeline_entry.to_dict(),
                 current_state=current_state,
             )
-            self._webhook_sink.emit(envelope)
+            raw_body = json.dumps(envelope.to_dict(), sort_keys=True)
+            self._repository.insert_delivery(
+                DeliveryRecord(
+                    event_id=event_id,
+                    incident_id=incident.incident_id,
+                    timeline_id=timeline_entry.timeline_id,
+                    event_type=event_type,
+                    event_version=self._webhook_sink.event_version,
+                    delivery_state="pending",
+                    delivery_attempts=0,
+                    last_delivery_error=None,
+                    last_delivery_at=None,
+                    payload_json=raw_body,
+                )
+            )
+            self._webhook_sink.emit_serialized(
+                raw_body=raw_body,
+                event_type=event_type,
+                event_id=event_id,
+                timestamp=envelope.timestamp,
+            )
+            self._repository.update_delivery(
+                DeliveryRecord(
+                    event_id=event_id,
+                    incident_id=incident.incident_id,
+                    timeline_id=timeline_entry.timeline_id,
+                    event_type=event_type,
+                    event_version=self._webhook_sink.event_version,
+                    delivery_state="delivered",
+                    delivery_attempts=1,
+                    last_delivery_error=None,
+                    last_delivery_at=timeline_entry.at,
+                    payload_json=raw_body,
+                )
+            )
             return True
-        except Exception:
+        except Exception as exc:
+            self._repository.update_delivery(
+                DeliveryRecord(
+                    event_id=event_id,
+                    incident_id=incident.incident_id,
+                    timeline_id=timeline_entry.timeline_id,
+                    event_type=event_type,
+                    event_version=self._webhook_sink.event_version,
+                    delivery_state="failed",
+                    delivery_attempts=1,
+                    last_delivery_error=str(exc),
+                    last_delivery_at=timeline_entry.at,
+                    payload_json=raw_body,
+                )
+            )
             logger.exception(
                 "Webhook delivery failed for incident_id=%s event_type=%s",
                 incident.incident_id,

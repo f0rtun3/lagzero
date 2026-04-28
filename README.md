@@ -215,6 +215,16 @@ lagzero ingest deploy \
   --metadata version=v1.2.3
 ```
 
+### 5. Inspect incident history
+
+```bash
+lagzero incidents active
+lagzero incidents list --status all --json
+lagzero incidents show <incident_id>
+lagzero incidents timeline <incident_id>
+lagzero incidents deliveries --delivery-state failed
+```
+
 ## Docker
 
 Build and run LagZero in a container:
@@ -340,6 +350,10 @@ LagZero is configured through environment variables:
 | `LAGZERO_INGEST_PORT` | Port for the ingest HTTP server | `8787` |
 | `LAGZERO_INGEST_PATH` | HTTP path for event ingestion | `/events` |
 | `LAGZERO_INGEST_REQUEST_TIMEOUT_SEC` | CLI timeout for ingest requests | `5` |
+| `LAGZERO_OPERATOR_API_ENABLED` | Enable the read-only local operator incident API | `false` |
+| `LAGZERO_OPERATOR_API_HOST` | Bind host for the operator API | `127.0.0.1` |
+| `LAGZERO_OPERATOR_API_PORT` | Port for the operator API | `8788` |
+| `LAGZERO_OPERATOR_API_PATH_PREFIX` | Path prefix for operator API routes | `/` |
 | `LAGZERO_SLACK_WEBHOOK_URL` | Slack webhook when emitter is `slack` | empty |
 
 ## How Detection Works
@@ -492,6 +506,19 @@ Material-change filtering keeps lifecycle output low-noise. LagZero emits `incid
 
 Each lifecycle change creates a timeline entry that is persisted alongside the active incident record.
 
+LagZero also stores outbound lifecycle delivery state separately so operators can inspect and manually recover failed webhook sends without mutating the underlying incident history.
+
+Operator commands:
+
+- `lagzero incidents list`
+- `lagzero incidents active`
+- `lagzero incidents show <incident_id>`
+- `lagzero incidents timeline <incident_id>`
+- `lagzero incidents deliveries`
+- `lagzero incidents redeliver --event-id <event_id>`
+- `lagzero incidents redeliver --incident-id <incident_id>`
+- `lagzero incidents redeliver --delivery-state failed`
+
 ## Signed Webhook Output
 
 LagZero can deliver lifecycle events to downstream systems as signed JSON webhooks.
@@ -537,6 +564,8 @@ The signature is `HMAC-SHA256` over:
 
 This keeps outbound automation idempotent and verifiable without letting the sink influence detection logic.
 
+Manual redelivery is launch-scoped and operator-invoked. LagZero does not run a background delivery queue before validation; it persists delivery state and lets operators replay failed webhook events explicitly.
+
 ## Persistence
 
 For launch, LagZero persists lifecycle state in SQLite.
@@ -545,12 +574,37 @@ It stores:
 
 - active and resolved incident records
 - incident timeline entries
+- lifecycle delivery records with payload JSON and delivery status
 
 This gives operators and downstream systems a durable history of:
 
 - when an incident opened
 - how it changed
 - when it resolved
+- which lifecycle webhooks were delivered, failed, or replayed
+
+## Operator API
+
+LagZero can expose a read-only local HTTP API for incident history.
+
+Enable it with:
+
+```bash
+export LAGZERO_OPERATOR_API_ENABLED=true
+export LAGZERO_OPERATOR_API_HOST=127.0.0.1
+export LAGZERO_OPERATOR_API_PORT=8788
+```
+
+Available endpoints:
+
+- `GET /health`
+- `GET /incidents`
+- `GET /incidents/{incident_id}`
+- `GET /incidents/{incident_id}/timeline`
+- `GET /incident-deliveries`
+- `POST /incident-deliveries/{event_id}/redeliver`
+
+The operator API binds to localhost by default and is intended for launch-era local inspection and automation, not internet exposure.
 
 ## Slack Output
 
@@ -581,6 +635,7 @@ The tests cover the core pure logic:
 - AI context building, prompt grounding, caching, and fallback parsing
 - incident family mapping, key derivation, lifecycle open-update-resolve behavior, and SQLite persistence
 - signed webhook envelope construction and bounded retry behavior
+- operator history CLI, read-only HTTP API, delivery bookkeeping, and restart continuity guards
 - ingest CLI transport and JSONL incident capture helpers
 
 For the Docker-backed chaos lab, the smoke subset currently covers:
@@ -631,3 +686,16 @@ Post-validation:
 ## Status
 
 LagZero is now a working Kafka incident-intelligence foundation with deterministic detection, correlation, grounded explanation, durable incident lifecycle tracking, signed webhook output, and a local chaos lab that validates the core incident scenarios end to end. Before launch, the focus stays narrow: harden lifecycle behavior, make incident history easy to inspect, and validate the current Kafka-first workflow in real use. Broader sinks, new backends, richer AI, and larger product surface area stay intentionally out of scope until after validation.
+
+## Launch Validation Workflow
+
+Before launch, the minimum validation loop should cover:
+
+1. Start the local Kafka stack and LagZero monitor.
+2. Trigger one healthy baseline and one severe pressure or stall scenario.
+3. Inject one deploy or error correlation event.
+4. Inspect the resulting incident with `lagzero incidents show` and `lagzero incidents timeline`.
+5. Inspect the same incident through the local operator API.
+6. Verify one signed lifecycle webhook payload and its headers.
+7. Force one failed delivery and recover it with `lagzero incidents redeliver`.
+8. Restart LagZero during an unresolved incident and confirm continuity without a synthetic update.

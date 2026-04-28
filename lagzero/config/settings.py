@@ -77,24 +77,28 @@ class Settings:
     ingest_port: int = 8787
     ingest_path: str = "/events"
     ingest_request_timeout_sec: float = 5.0
+    operator_api_enabled: bool = False
+    operator_api_host: str = "127.0.0.1"
+    operator_api_port: int = 8788
+    operator_api_path_prefix: str = "/"
     slack_webhook_url: str | None = None
     correlation_window_sec: float = 900.0
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls, *, require_monitoring: bool = True) -> "Settings":
         bootstrap_servers = os.getenv("LAGZERO_BOOTSTRAP_SERVERS", "localhost:9092")
         consumer_group = os.getenv("LAGZERO_CONSUMER_GROUP", "").strip()
-        if not consumer_group:
+        if require_monitoring and not consumer_group:
             raise ValueError("LAGZERO_CONSUMER_GROUP is required.")
 
         topics_raw = os.getenv("LAGZERO_TOPICS", "")
-        if not topics_raw.strip():
+        if require_monitoring and not topics_raw.strip():
             raise ValueError("LAGZERO_TOPICS is required.")
 
         return cls(
             bootstrap_servers=bootstrap_servers,
             consumer_group=consumer_group,
-            topics=_parse_topics(topics_raw),
+            topics=_parse_topics(topics_raw) if topics_raw.strip() else [],
             poll_interval_sec=_parse_optional_float(os.getenv("LAGZERO_POLL_INTERVAL_SEC"), 10.0),
             emitter=os.getenv("LAGZERO_EMITTER", "stdout").strip().lower() or "stdout",
             log_level=os.getenv("LAGZERO_LOG_LEVEL", "INFO").strip().upper() or "INFO",
@@ -202,6 +206,13 @@ class Settings:
             ingest_request_timeout_sec=_parse_optional_float(
                 os.getenv("LAGZERO_INGEST_REQUEST_TIMEOUT_SEC"), 5.0
             ),
+            operator_api_enabled=os.getenv("LAGZERO_OPERATOR_API_ENABLED", "false").strip().lower()
+            == "true",
+            operator_api_host=os.getenv("LAGZERO_OPERATOR_API_HOST", "127.0.0.1").strip()
+            or "127.0.0.1",
+            operator_api_port=_parse_optional_int(os.getenv("LAGZERO_OPERATOR_API_PORT"), 8788),
+            operator_api_path_prefix=os.getenv("LAGZERO_OPERATOR_API_PATH_PREFIX", "/").strip()
+            or "/",
             slack_webhook_url=os.getenv("LAGZERO_SLACK_WEBHOOK_URL") or None,
             correlation_window_sec=_parse_optional_float(
                 os.getenv("LAGZERO_CORRELATION_WINDOW_SEC"), 900.0

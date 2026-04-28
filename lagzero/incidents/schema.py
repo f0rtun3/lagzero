@@ -57,6 +57,23 @@ class WebhookEventEnvelope:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryRecord:
+    event_id: str
+    incident_id: str
+    timeline_id: str
+    event_type: str
+    event_version: str
+    delivery_state: str
+    delivery_attempts: int
+    last_delivery_error: str | None
+    last_delivery_at: float | None
+    payload_json: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class LifecycleResult:
     event_type: str
     incident: IncidentRecord
