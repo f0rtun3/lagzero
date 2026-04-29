@@ -2,7 +2,15 @@ import json
 import threading
 import time
 
-from lagzero.lab.events import clear_incident_log, latest_group_incident, load_incidents, wait_for_incident
+from lagzero.lab.events import (
+    append_jsonl,
+    clear_incident_log,
+    clear_jsonl,
+    latest_group_incident,
+    load_incidents,
+    load_jsonl,
+    wait_for_incident,
+)
 
 
 def test_clear_and_load_incidents(tmp_path) -> None:
@@ -49,3 +57,14 @@ def test_wait_for_incident_returns_matching_payload(tmp_path) -> None:
         thread.join()
 
     assert incident["consumer_group"] == "payments"
+
+
+def test_generic_jsonl_helpers_append_and_load(tmp_path) -> None:
+    path = tmp_path / "items.jsonl"
+    clear_jsonl(path)
+    append_jsonl(path, {"event_id": "evt-1"})
+    append_jsonl(path, {"event_id": "evt-2"})
+
+    items = load_jsonl(path)
+
+    assert [item["event_id"] for item in items] == ["evt-1", "evt-2"]

@@ -43,6 +43,11 @@ services:
       LAGZERO_REBALANCE_WINDOW_SEC: ${LAGZERO_REBALANCE_WINDOW_SEC:-90}
       LAGZERO_INFRA_WINDOW_SEC: ${LAGZERO_INFRA_WINDOW_SEC:-300}
       LAGZERO_MAX_CORRELATIONS: ${LAGZERO_MAX_CORRELATIONS:-3}
+      LAGZERO_INCIDENTS_ENABLED: ${LAGZERO_INCIDENTS_ENABLED:-true}
+      LAGZERO_SQLITE_PATH: ${LAGZERO_SQLITE_PATH:-/var/lagzero/lagzero.db}
+      LAGZERO_WEBHOOK_ENABLED: ${LAGZERO_WEBHOOK_ENABLED:-false}
+      LAGZERO_WEBHOOK_URL: ${LAGZERO_WEBHOOK_URL:-}
+      LAGZERO_WEBHOOK_SECRET: ${LAGZERO_WEBHOOK_SECRET:-}
       LAGZERO_INGEST_ENABLED: "true"
       LAGZERO_INGEST_HOST: 0.0.0.0
       LAGZERO_INGEST_PORT: ${LAGZERO_INGEST_PORT:-8787}
@@ -52,6 +57,8 @@ services:
       - "${LAGZERO_INGEST_PORT:-8787}:${LAGZERO_INGEST_PORT:-8787}"
     volumes:
       - ${LAGZERO_EVENT_LOG_DIR:-./.chaos/artifacts}:/var/lagzero
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       kafka:
         condition: service_started

@@ -20,6 +20,8 @@ _ALL_SCENARIOS = (
     "partition_skew",
     "deploy_correlation",
     "error_correlation",
+    "restart_continuity",
+    "webhook_redelivery",
 )
 
 
@@ -39,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--ingest-url",
         default="http://127.0.0.1:8787/events",
         help="LagZero ingest endpoint used for correlation scenarios.",
+    )
+    parser.add_argument(
+        "--contract-phase",
+        type=int,
+        default=1,
+        help="Lifecycle/delivery contract rollout phase to enforce.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -62,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         compose_file=(repo_root / args.compose_file).resolve(),
         artifact_root=(repo_root / args.artifact_root).resolve(),
         ingest_url=args.ingest_url,
+        contract_phase=args.contract_phase,
     )
 
     if args.command == "down":
@@ -88,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
                         "passed": bool(data.get("passed")),
                         "reason": data.get("reason"),
                         "final_incident": data.get("final_incident"),
+                        "snapshot_passed": bool((data.get("snapshot_contract") or {}).get("passed")),
+                        "lifecycle_passed": bool((data.get("lifecycle_contract") or {}).get("passed")),
+                        "delivery_passed": bool((data.get("delivery_contract") or {}).get("passed")),
+                        "overall_passed": bool(data.get("overall_passed", data.get("passed"))),
                         "source": "contract-report.json",
                     }
                 )
@@ -119,9 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         results: list[dict[str, object]] = []
         for scenario_name in (
             "baseline_healthy_lag",
-            "burst_spike",
             "sustained_pressure",
             "deploy_correlation",
+            "restart_continuity",
+            "webhook_redelivery",
         ):
             results.append(_run_named_scenario(harness, scenario_name))
         summary_path = harness.write_smoke_summary(results)
@@ -154,6 +168,10 @@ def _run_named_scenario(harness: ChaosLabHarness, scenario_name: str) -> dict[st
         return _run_deploy_correlation(harness)
     elif scenario_name == "error_correlation":
         return _run_error_correlation(harness)
+    elif scenario_name == "restart_continuity":
+        return _run_restart_continuity(harness)
+    elif scenario_name == "webhook_redelivery":
+        return _run_webhook_redelivery(harness)
     raise ValueError(f"Unsupported scenario: {scenario_name}")
 
 
@@ -165,6 +183,10 @@ def _result_payload(scenario: Scenario, validation: ScenarioValidation) -> dict[
         "contract_report_path": str(scenario.contract_report_path),
         "passed": validation.passed,
         "reason": validation.reason,
+        "snapshot_contract": validation.snapshot_contract.to_dict(),
+        "lifecycle_contract": validation.lifecycle_contract.to_dict(),
+        "delivery_contract": validation.delivery_contract.to_dict(),
+        "overall_passed": validation.overall_passed,
         "final_incident": validation.final_incident,
     }
 
@@ -320,9 +342,77 @@ def _run_error_correlation(harness: ChaosLabHarness) -> dict[str, object]:
         consumer.terminate()
 
 
+def _run_restart_continuity(harness: ChaosLabHarness) -> dict[str, object]:
+    scenario = harness.prepare_scenario("restart_continuity")
+    consumer = harness.start_slow_consumer(scenario, delay_sec=1.0)
+    try:
+        harness.produce_perf(scenario, num_records=2000, throughput=-1)
+        harness.pause_consumer_runner()
+        harness.assert_incident(
+            scenario,
+            lambda incident: incident.get("scope") == "consumer_group"
+            and incident.get("anomaly") in {"system_under_pressure", "consumer_stalled"},
+            timeout_sec=60.0,
+        )
+        harness.capture_state_artifacts(scenario)
+        harness.restart_lagzero(scenario)
+        harness.sleep(6.0)
+        validation = harness.assert_contract(scenario, timeout_sec=60.0)
+        return _result_payload(scenario, validation)
+    finally:
+        try:
+            harness.unpause_consumer_runner()
+        except Exception:
+            pass
+        consumer.terminate()
+
+
+def _run_webhook_redelivery(harness: ChaosLabHarness) -> dict[str, object]:
+    scenario = harness.prepare_scenario("webhook_redelivery")
+    consumer = harness.start_slow_consumer(scenario, delay_sec=1.0)
+    producer = None
+    try:
+        harness.fail_next_webhook_delivery(1)
+        producer = harness.produce_perf_async(scenario, num_records=2000, throughput=20)
+        harness.assert_incident(
+            scenario,
+            lambda incident: incident.get("scope") == "consumer_group"
+            and incident.get("anomaly") in {"system_under_pressure", "consumer_stalled"},
+            timeout_sec=60.0,
+        )
+        harness.capture_state_artifacts(scenario)
+        state = latest_scenario_state(harness._artifact_root, scenario.name)
+        failed_event_id = next(
+            (
+                str(delivery["event_id"])
+                for delivery in state.get("deliveries", [])
+                if delivery.get("delivery_state") == "failed"
+            ),
+            None,
+        )
+        if failed_event_id is None:
+            raise RuntimeError("Expected a failed delivery before redelivery, but none was persisted.")
+        harness.redeliver_event(scenario, failed_event_id)
+        harness.sleep(2.0)
+        harness.capture_state_artifacts(scenario)
+        validation = harness.assert_contract(scenario, timeout_sec=60.0)
+        return _result_payload(scenario, validation)
+    finally:
+        if producer is not None:
+            producer.terminate()
+        consumer.terminate()
+
+
 def latest_scenario_incidents(artifact_root: Path, scenario_name: str) -> list[dict[str, object]]:
     scenario_path = artifact_root / scenario_name.replace("_", "-") / "incidents.jsonl"
     return load_incidents(scenario_path)
+
+
+def latest_scenario_state(artifact_root: Path, scenario_name: str) -> dict[str, list[dict[str, object]]]:
+    scenario_path = artifact_root / scenario_name.replace("_", "-") / "state-snapshot.json"
+    if not scenario_path.exists():
+        return {"incidents": [], "timeline": [], "deliveries": []}
+    return json.loads(scenario_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

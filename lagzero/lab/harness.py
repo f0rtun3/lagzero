@@ -7,11 +7,18 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
-from lagzero.lab.contracts import ScenarioValidation, wait_for_contract
-from lagzero.lab.events import clear_incident_log, wait_for_incident
+from lagzero.lab.contracts import ScenarioValidation, validate_scenario_contract, wait_for_snapshot_contract
+from lagzero.lab.events import clear_incident_log, clear_jsonl, load_jsonl, wait_for_incident
+from lagzero.lab.state import build_lifecycle_events, snapshot_sqlite_state
+from lagzero.lab.webhook_capture import WebhookCaptureServer
 
 KAFKA_BIN_DIR = "/opt/bitnami/kafka/bin"
+WEBHOOK_CAPTURE_HOST = "127.0.0.1"
+WEBHOOK_CAPTURE_PORT = 8790
+WEBHOOK_CAPTURE_PATH = "/webhooks"
+WEBHOOK_SECRET = "lagzero-chaos-secret"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +36,22 @@ class Scenario:
     def contract_report_path(self) -> Path:
         return self.artifact_dir / "contract-report.json"
 
+    @property
+    def lifecycle_events_path(self) -> Path:
+        return self.artifact_dir / "lifecycle-events.jsonl"
+
+    @property
+    def deliveries_path(self) -> Path:
+        return self.artifact_dir / "deliveries.jsonl"
+
+    @property
+    def state_snapshot_path(self) -> Path:
+        return self.artifact_dir / "state-snapshot.json"
+
+    @property
+    def sqlite_path(self) -> Path:
+        return self.artifact_dir / "lagzero.db"
+
 
 class ChaosLabHarness:
     def __init__(
@@ -38,17 +61,23 @@ class ChaosLabHarness:
         compose_file: Path,
         artifact_root: Path,
         ingest_url: str,
+        contract_phase: int = 1,
     ) -> None:
         self._repo_root = repo_root
         self._compose_file = compose_file
         self._artifact_root = artifact_root
         self._ingest_url = ingest_url
+        self._contract_phase = contract_phase
         self._artifact_root.mkdir(parents=True, exist_ok=True)
+        self._webhook_capture: WebhookCaptureServer | None = None
 
     def up_base_stack(self) -> None:
+        self._ensure_webhook_capture().start()
         self._compose(["up", "-d", "kafka", "consumer-runner"])
 
     def down_stack(self) -> None:
+        if self._webhook_capture is not None:
+            self._webhook_capture.stop()
         self._compose(["down", "-v", "--remove-orphans"])
 
     def prepare_scenario(self, name: str) -> Scenario:
@@ -61,7 +90,14 @@ class ChaosLabHarness:
         )
         scenario.artifact_dir.mkdir(parents=True, exist_ok=True)
         clear_incident_log(scenario.incident_log_path)
+        clear_jsonl(scenario.lifecycle_events_path)
+        clear_jsonl(scenario.deliveries_path)
         self._clear_contract_report(scenario)
+        if scenario.state_snapshot_path.exists():
+            scenario.state_snapshot_path.unlink()
+        if scenario.sqlite_path.exists():
+            scenario.sqlite_path.unlink()
+        self._ensure_webhook_capture().set_output_path(scenario.deliveries_path)
         self._ensure_topic(scenario.topic)
         self._restart_lagzero(scenario)
         self._wait_for_ingest_health()
@@ -224,12 +260,23 @@ class ChaosLabHarness:
         *,
         timeout_sec: float = 45.0,
     ) -> ScenarioValidation:
-        validation = wait_for_contract(
+        wait_for_snapshot_contract(
             scenario.incident_log_path,
             scenario_name=scenario.name,
             consumer_group=scenario.consumer_group,
+            current_phase=self._contract_phase,
             timeout_sec=timeout_sec,
             poll_interval_sec=1.0,
+        )
+        self.capture_state_artifacts(scenario)
+        validation = validate_scenario_contract(
+            scenario_name=scenario.name,
+            incidents=load_jsonl(scenario.incident_log_path),
+            consumer_group=scenario.consumer_group,
+            lifecycle_events=load_jsonl(scenario.lifecycle_events_path),
+            state_snapshot=json.loads(scenario.state_snapshot_path.read_text(encoding="utf-8")),
+            captured_deliveries=load_jsonl(scenario.deliveries_path),
+            current_phase=self._contract_phase,
         )
         self.write_contract_report(scenario, validation)
         return validation
@@ -246,12 +293,64 @@ class ChaosLabHarness:
             "artifact_dir": str(scenario.artifact_dir),
             "passed": validation.passed,
             "reason": validation.reason,
+            "snapshot_contract": validation.snapshot_contract.to_dict(),
+            "lifecycle_contract": validation.lifecycle_contract.to_dict(),
+            "delivery_contract": validation.delivery_contract.to_dict(),
+            "overall_passed": validation.overall_passed,
             "final_incident": validation.final_incident,
         }
         scenario.contract_report_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def capture_state_artifacts(self, scenario: Scenario) -> dict[str, list[dict[str, object]]]:
+        state_snapshot = snapshot_sqlite_state(scenario.sqlite_path)
+        scenario.state_snapshot_path.write_text(
+            json.dumps(state_snapshot, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        lifecycle_events = build_lifecycle_events(state_snapshot)
+        clear_jsonl(scenario.lifecycle_events_path)
+        if lifecycle_events:
+            with scenario.lifecycle_events_path.open("a", encoding="utf-8") as handle:
+                for event in lifecycle_events:
+                    handle.write(json.dumps(event, sort_keys=True) + "\n")
+        return state_snapshot
+
+    def restart_lagzero(self, scenario: Scenario) -> None:
+        self._restart_lagzero(scenario)
+
+    def redeliver_event(self, scenario: Scenario, event_id: str) -> None:
+        env = os.environ.copy()
+        env.update(
+            {
+                "LAGZERO_INCIDENTS_ENABLED": "true",
+                "LAGZERO_SQLITE_PATH": str(scenario.sqlite_path),
+                "LAGZERO_WEBHOOK_ENABLED": "true",
+                "LAGZERO_WEBHOOK_URL": self._capture_url,
+                "LAGZERO_WEBHOOK_SECRET": WEBHOOK_SECRET,
+            }
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "lagzero.main",
+                "incidents",
+                "redeliver",
+                "--event-id",
+                event_id,
+            ],
+            cwd=self._repo_root,
+            env=env,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def fail_next_webhook_delivery(self, count: int = 1) -> None:
+        self._ensure_webhook_capture().fail_next(count)
 
     def write_smoke_summary(self, results: list[dict[str, object]]) -> Path:
         summary_path = self._artifact_root / "smoke-summary.json"
@@ -268,17 +367,26 @@ class ChaosLabHarness:
         )
         self._compose(["exec", "-T", "kafka", "bash", "-lc", command])
 
-    def _restart_lagzero(self, scenario: Scenario) -> None:
+    @property
+    def _capture_url(self) -> str:
+        return f"http://host.docker.internal:{WEBHOOK_CAPTURE_PORT}{WEBHOOK_CAPTURE_PATH}"
+
+    def _restart_lagzero(self, scenario: Scenario, *, webhook_url: str | None = None) -> None:
         env = os.environ.copy()
         env.update(
             {
                 "LAGZERO_TOPICS": scenario.topic,
                 "LAGZERO_CONSUMER_GROUP": scenario.consumer_group,
                 "LAGZERO_EVENT_LOG_DIR": str(scenario.artifact_dir.resolve()),
+                "LAGZERO_INCIDENTS_ENABLED": "true",
+                "LAGZERO_SQLITE_PATH": "/var/lagzero/lagzero.db",
+                "LAGZERO_WEBHOOK_ENABLED": "true",
+                "LAGZERO_WEBHOOK_URL": webhook_url or self._capture_url,
+                "LAGZERO_WEBHOOK_SECRET": WEBHOOK_SECRET,
             }
         )
         try:
-            self._compose(["up", "-d", "--force-recreate", "lagzero"], env=env)
+            self._compose(["up", "-d", "--build", "--force-recreate", "lagzero"], env=env)
         except subprocess.CalledProcessError:
             # Docker Compose can occasionally fail to recreate the service due to stale container
             # IDs or name conflicts after abrupt stops. Clean up the service and retry once.
@@ -287,7 +395,7 @@ class ChaosLabHarness:
                 cwd=self._repo_root,
                 check=False,
             )
-            self._compose(["up", "-d", "--force-recreate", "lagzero"], env=env)
+            self._compose(["up", "-d", "--build", "--force-recreate", "lagzero"], env=env)
 
     def _wait_for_ingest_health(self, timeout_sec: float = 30.0) -> None:
         deadline = time.time() + timeout_sec
@@ -315,6 +423,16 @@ class ChaosLabHarness:
     def _clear_contract_report(self, scenario: Scenario) -> None:
         if scenario.contract_report_path.exists():
             scenario.contract_report_path.unlink()
+
+    def _ensure_webhook_capture(self) -> WebhookCaptureServer:
+        if self._webhook_capture is None:
+            self._webhook_capture = WebhookCaptureServer(
+                host=WEBHOOK_CAPTURE_HOST,
+                port=WEBHOOK_CAPTURE_PORT,
+                path=WEBHOOK_CAPTURE_PATH,
+                secret=WEBHOOK_SECRET,
+            )
+        return cast(WebhookCaptureServer, self._webhook_capture)
 
     def _compose(self, args: list[str], env: dict[str, str] | None = None) -> None:
         subprocess.run(

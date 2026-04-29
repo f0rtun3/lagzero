@@ -264,6 +264,12 @@ Run an individual scenario with:
 ./scripts/run_chaos_lab.sh scenario burst_spike
 ```
 
+The lab can also enforce lifecycle and delivery rollout phases explicitly:
+
+```bash
+./scripts/run_chaos_lab.sh --contract-phase 1 smoke
+```
+
 Each scenario now writes:
 
 - `incidents.jsonl`: raw emitted incident stream
@@ -273,7 +279,15 @@ The smoke suite also writes:
 
 - `smoke-summary.json`: one structured verdict per smoke scenario
 
-The chaos lab validates scenario contracts against the full artifact, not an exact transition sequence. That makes it more resilient to future decision-layer tuning while still failing on semantic regressions such as:
+The chaos lab now validates three contract layers:
+
+- `snapshot_contract`: anomaly, health, and correlation semantics
+- `lifecycle_contract`: incident open, update, resolve, and restart continuity behavior
+- `delivery_contract`: signed webhook delivery and redelivery behavior
+
+Each scenario writes a single `contract-report.json` with those sections plus an overall verdict.
+
+The lab validates contracts against the full artifact set, not an exact transition sequence. That makes it more resilient to future decision-layer tuning while still failing on semantic regressions such as:
 
 - healthy baseline ending in `consumer_stalled`
 - burst scenarios stabilizing as severe failure without justification
@@ -292,6 +306,8 @@ The full local chaos suite now has contract coverage for:
 - `partition_skew`
 - `deploy_correlation`
 - `error_correlation`
+- `restart_continuity`
+- `webhook_redelivery`
 
 At the time of the latest README update, all of those scenarios have passing local contract artifacts.
 

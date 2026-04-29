@@ -1,4 +1,14 @@
-from lagzero.lab.contracts import ScenarioValidation, validate_scenario_contract
+from lagzero.lab.contracts import (
+    ContractSection,
+    ScenarioValidation,
+    _SCENARIO_EXPECTATIONS,
+    validate_delivery_contract,
+    validate_lifecycle_contract,
+    validate_scenario_contract,
+)
+from lagzero.lab.state import build_logical_incident_key
+from lagzero.lab.webhook_capture import build_capture_record
+from lagzero.sinks.signing import build_signature
 
 
 def _group_event(
@@ -29,108 +39,194 @@ def _group_event(
     }
 
 
-def _partition_event(
+def _state_snapshot(
     *,
-    anomaly: str,
-    partition: int = 0,
-    consumer_group: str = "payments",
-) -> dict[str, object]:
+    incident_id: str = "inc-1",
+    incident_key: str = "consumer_group:payments:pressure",
+    family: str = "pressure",
+    delivery_attempts: int = 1,
+) -> dict[str, list[dict[str, object]]]:
+    payload = {
+        "event_id": "evt-1",
+        "event_type": "incident.opened",
+        "event_version": "1.0",
+        "incident": {"incident_id": incident_id},
+        "timeline_entry": {"timeline_id": "tl-1"},
+        "current_state": {"anomaly": "system_under_pressure"},
+    }
     return {
-        "scope": "partition",
-        "consumer_group": consumer_group,
-        "partition": partition,
-        "anomaly": anomaly,
+        "incidents": [
+            {
+                "incident_id": incident_id,
+                "incident_key": incident_key,
+                "family": family,
+                "status": "open",
+                "opened_at": 1.0,
+                "updated_at": 2.0,
+            }
+        ],
+        "timeline": [
+            {
+                "timeline_id": "tl-1",
+                "incident_id": incident_id,
+                "entry_type": "incident_opened",
+                "at": 1.0,
+                "summary": "Incident opened",
+                "details_json": {"anomaly": "system_under_pressure"},
+            }
+        ],
+        "deliveries": [
+            {
+                "event_id": "evt-1",
+                "incident_id": incident_id,
+                "timeline_id": "tl-1",
+                "event_type": "incident.opened",
+                "event_version": "1.0",
+                "delivery_state": "delivered",
+                "delivery_attempts": delivery_attempts,
+                "payload_json": payload,
+            }
+        ],
     }
 
 
-def test_baseline_contract_accepts_healthy_final_state() -> None:
-    result = validate_scenario_contract(
-        scenario_name="baseline_healthy_lag",
-        incidents=[
-            _group_event(anomaly="bounded_lag", service_health="healthy"),
-            _group_event(anomaly="normal", service_health="healthy"),
-        ],
-        consumer_group="payments",
+def _lifecycle_events() -> list[dict[str, object]]:
+    return [
+        {
+            "logical_incident_key": build_logical_incident_key(
+                incident_key="consumer_group:payments:pressure",
+                family="pressure",
+            ),
+            "incident_id": "inc-1",
+            "incident_key": "consumer_group:payments:pressure",
+            "family": "pressure",
+            "timeline_id": "tl-1",
+            "entry_type": "incident_opened",
+            "event_type": "incident.opened",
+            "at": 1.0,
+            "summary": "Incident opened",
+            "details": {"anomaly": "system_under_pressure"},
+        }
+    ]
+
+
+def test_logical_incident_key_combines_incident_key_and_family() -> None:
+    assert (
+        build_logical_incident_key(
+            incident_key="consumer_group:payments:pressure",
+            family="pressure",
+        )
+        == "consumer_group:payments:pressure|pressure"
     )
 
-    assert result.passed is True
 
-
-def test_burst_contract_rejects_stalled_with_active_producer() -> None:
-    result = validate_scenario_contract(
-        scenario_name="burst_spike",
-        incidents=[
-            _group_event(anomaly="system_under_pressure", service_health="degraded", producer_rate=20.0),
-            _group_event(anomaly="consumer_stalled", service_health="failing", producer_rate=10.0, processing_rate=0.0),
-        ],
-        consumer_group="payments",
-    )
-
-    assert result.passed is False
-
-
-def test_burst_contract_accepts_idle_but_delayed_end_state() -> None:
-    result = validate_scenario_contract(
-        scenario_name="burst_spike",
-        incidents=[
-            _group_event(anomaly="system_under_pressure", service_health="degraded", producer_rate=20.0),
-            _group_event(anomaly="idle_but_delayed", service_health="degraded", producer_rate=0.0, processing_rate=0.0, offset_lag=50),
-        ],
-        consumer_group="payments",
-    )
-
-    assert result.passed is True
-
-
-def test_sustained_pressure_contract_requires_eventual_failure() -> None:
-    result = validate_scenario_contract(
+def test_phase_one_scenario_reports_all_contract_sections() -> None:
+    validation = validate_scenario_contract(
         scenario_name="sustained_pressure",
         incidents=[
             _group_event(anomaly="system_under_pressure", service_health="degraded"),
             _group_event(anomaly="consumer_stalled", service_health="failing"),
         ],
         consumer_group="payments",
+        lifecycle_events=_lifecycle_events(),
+        state_snapshot=_state_snapshot(),
+        captured_deliveries=[],
+        current_phase=1,
     )
 
-    assert result.passed is True
+    assert isinstance(validation.snapshot_contract, ContractSection)
+    assert isinstance(validation.lifecycle_contract, ContractSection)
+    assert isinstance(validation.delivery_contract, ContractSection)
+    assert validation.snapshot_contract.passed is True
+    assert validation.lifecycle_contract.passed is True
 
 
-def test_deploy_correlation_contract_requires_primary_cause() -> None:
-    result = validate_scenario_contract(
-        scenario_name="deploy_correlation",
-        incidents=[
-            _group_event(
-                anomaly="system_under_pressure",
-                service_health="degraded",
-                primary_cause="deploy_within_window",
-                primary_cause_confidence=0.82,
+def test_lifecycle_contract_rejects_duplicate_open_for_logical_incident() -> None:
+    lifecycle = _lifecycle_events() * 2
+    section = validate_lifecycle_contract(
+        scenario_name="sustained_pressure",
+        expectation=_SCENARIO_EXPECTATIONS["sustained_pressure"],
+        incidents=[_group_event(anomaly="consumer_stalled", service_health="failing")],
+        lifecycle_events=lifecycle,
+        state_snapshot=_state_snapshot(),
+        current_phase=1,
+    )
+    assert section.passed is False
+    assert "more than one `incident.opened`" in section.reason
+
+
+def test_restart_continuity_rejects_synthetic_update() -> None:
+    lifecycle = _lifecycle_events() + [
+        {
+            "logical_incident_key": build_logical_incident_key(
+                incident_key="consumer_group:payments:pressure",
+                family="pressure",
             ),
-        ],
+            "incident_id": "inc-1",
+            "incident_key": "consumer_group:payments:pressure",
+            "family": "pressure",
+            "timeline_id": "tl-2",
+            "entry_type": "health_changed",
+            "event_type": "incident.updated",
+            "at": 2.0,
+            "summary": "Changed",
+            "details": {"changes": ["health_changed"]},
+        }
+    ]
+    validation = validate_scenario_contract(
+        scenario_name="restart_continuity",
+        incidents=[_group_event(anomaly="system_under_pressure", service_health="degraded")],
         consumer_group="payments",
+        lifecycle_events=lifecycle,
+        state_snapshot=_state_snapshot(),
+        captured_deliveries=[],
+        current_phase=1,
     )
+    assert validation.lifecycle_contract.passed is False
+    assert "unexpected `incident.updated`" in validation.lifecycle_contract.reason
 
-    assert result.passed is True
 
-
-def test_partition_skew_contract_requires_visible_partition_truth() -> None:
-    result = validate_scenario_contract(
-        scenario_name="partition_skew",
-        incidents=[
-            _group_event(anomaly="system_under_pressure", service_health="degraded"),
-            _partition_event(anomaly="partition_skew", partition=3),
-        ],
-        consumer_group="payments",
+def test_delivery_contract_validates_hmac_and_redelivery_attempts() -> None:
+    payload = '{"event_id":"evt-1","event_type":"incident.opened","event_version":"1.0","incident":{"incident_id":"inc-1"},"timeline_entry":{"timeline_id":"tl-1"},"current_state":{"anomaly":"system_under_pressure"}}'
+    timestamp = "2026-04-29T00:00:00Z"
+    captured = build_capture_record(
+        headers={
+            "X-LagZero-Timestamp": timestamp,
+            "X-LagZero-Signature": build_signature("secret", timestamp=timestamp, raw_body=payload),
+        },
+        raw_body=payload,
+        payload={
+            "event_id": "evt-1",
+            "event_type": "incident.opened",
+            "event_version": "1.0",
+            "incident": {"incident_id": "inc-1"},
+            "timeline_entry": {"timeline_id": "tl-1"},
+            "current_state": {"anomaly": "system_under_pressure"},
+        },
+        secret="secret",
     )
+    state = _state_snapshot(delivery_attempts=2)
+    section = validate_delivery_contract(
+        scenario_name="webhook_redelivery",
+        expectation=_SCENARIO_EXPECTATIONS["webhook_redelivery"],
+        state_snapshot=state,
+        captured_deliveries=[captured, captured],
+        current_phase=1,
+    )
+    assert section.passed is True
+    assert section.evidence["captured_attempts_by_event_id"]["evt-1"] == 2
 
-    assert result.passed is True
 
-
-def test_scenario_validation_can_be_serialized_for_artifacts() -> None:
+def test_scenario_validation_serializes_sections() -> None:
     validation = ScenarioValidation(
-        passed=True,
-        reason="contract satisfied",
+        snapshot_contract=ContractSection(True, "snapshot ok"),
+        lifecycle_contract=ContractSection(True, "lifecycle ok"),
+        delivery_contract=ContractSection(True, "delivery ok"),
+        overall_passed=True,
         final_incident={"scope": "consumer_group", "anomaly": "normal"},
     )
 
-    assert validation.to_dict()["passed"] is True
-    assert validation.to_dict()["final_incident"]["anomaly"] == "normal"
+    payload = validation.to_dict()
+    assert payload["overall_passed"] is True
+    assert payload["snapshot_contract"]["passed"] is True
+    assert payload["final_incident"]["anomaly"] == "normal"

@@ -15,16 +15,31 @@ def clear_incident_log(path: str | Path) -> None:
     target.write_text("", encoding="utf-8")
 
 
-def load_incidents(path: str | Path) -> list[IncidentPayload]:
+def clear_jsonl(path: str | Path) -> None:
+    clear_incident_log(path)
+
+
+def append_jsonl(path: str | Path, payload: dict[str, object]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def load_jsonl(path: str | Path) -> list[dict[str, object]]:
     target = Path(path)
     if not target.exists():
         return []
-    incidents: list[IncidentPayload] = []
+    items: list[dict[str, object]] = []
     for line in target.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        incidents.append(json.loads(line))
-    return incidents
+        items.append(json.loads(line))
+    return items
+
+
+def load_incidents(path: str | Path) -> list[IncidentPayload]:
+    return load_jsonl(path)
 
 
 def wait_for_incident(
