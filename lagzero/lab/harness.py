@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -82,10 +83,11 @@ class ChaosLabHarness:
 
     def prepare_scenario(self, name: str) -> Scenario:
         slug = name.replace("_", "-")
+        run_suffix = uuid.uuid4().hex[:8]
         scenario = Scenario(
             name=name,
-            topic=f"orders-{slug}",
-            consumer_group=f"payments-{slug}",
+            topic=f"orders-{slug}-{run_suffix}",
+            consumer_group=f"payments-{slug}-{run_suffix}",
             artifact_dir=self._artifact_root / slug,
         )
         scenario.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,7 @@ class ChaosLabHarness:
         if scenario.sqlite_path.exists():
             scenario.sqlite_path.unlink()
         self._ensure_webhook_capture().set_output_path(scenario.deliveries_path)
+        self._reset_kafka_state(scenario)
         self._ensure_topic(scenario.topic)
         self._restart_lagzero(scenario)
         self._wait_for_ingest_health()
@@ -366,6 +369,56 @@ class ChaosLabHarness:
             f"--create --if-not-exists --topic {topic} --partitions 4 --replication-factor 1"
         )
         self._compose(["exec", "-T", "kafka", "bash", "-lc", command])
+
+    def _reset_kafka_state(self, scenario: Scenario) -> None:
+        self._delete_consumer_group(scenario.consumer_group)
+        self._delete_topic(scenario.topic)
+
+    def _delete_consumer_group(self, consumer_group: str) -> None:
+        command = (
+            f"{KAFKA_BIN_DIR}/kafka-consumer-groups.sh --bootstrap-server kafka:9092 "
+            f"--delete --group {consumer_group}"
+        )
+        proc = subprocess.run(
+            ["docker", "compose", "-f", str(self._compose_file), "exec", "-T", "kafka", "bash", "-lc", command],
+            cwd=self._repo_root,
+            text=True,
+            capture_output=True,
+        )
+        output = ((proc.stdout or "") + (proc.stderr or "")).lower()
+        if proc.returncode == 0:
+            return
+        if (
+            "does not exist" in output
+            or "group id not found" in output
+            or "group '" in output and "not found" in output
+            or "marked for deletion" in output
+        ):
+            return
+        raise RuntimeError(f"Failed to delete consumer group {consumer_group!r}: {output.strip()}")
+
+    def _delete_topic(self, topic: str) -> None:
+        delete_command = (
+            f"{KAFKA_BIN_DIR}/kafka-topics.sh --bootstrap-server kafka:9092 "
+            f"--delete --if-exists --topic {topic}"
+        )
+        self._compose(["exec", "-T", "kafka", "bash", "-lc", delete_command])
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            topics = self._compose_output(
+                [
+                    "exec",
+                    "-T",
+                    "kafka",
+                    "bash",
+                    "-lc",
+                    f"{KAFKA_BIN_DIR}/kafka-topics.sh --bootstrap-server kafka:9092 --list",
+                ]
+            )
+            if topic not in {line.strip() for line in topics.splitlines()}:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"Timed out waiting for topic {topic!r} to be deleted")
 
     @property
     def _capture_url(self) -> str:

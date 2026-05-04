@@ -195,7 +195,14 @@ def _run_baseline(harness: ChaosLabHarness) -> dict[str, object]:
     scenario = harness.prepare_scenario("baseline_healthy_lag")
     consumer = harness.start_slow_consumer(scenario, delay_sec=0.2)
     try:
-        harness.produce_perf(scenario, num_records=120, throughput=5)
+        harness.produce_perf(
+            scenario,
+            num_records=20,
+            throughput=5,
+            producer_props={
+                "partitioner.class": "org.apache.kafka.clients.producer.RoundRobinPartitioner",
+            },
+        )
         validation = harness.assert_contract(scenario)
         return _result_payload(scenario, validation)
     finally:
@@ -207,6 +214,12 @@ def _run_burst_spike(harness: ChaosLabHarness) -> dict[str, object]:
     consumer = harness.start_slow_consumer(scenario, delay_sec=0.5)
     try:
         harness.produce_perf(scenario, num_records=4000, throughput=-1)
+        harness.assert_incident(
+            scenario,
+            lambda incident: incident.get("scope") == "consumer_group"
+            and incident.get("anomaly") not in {"normal", "bounded_lag"},
+            timeout_sec=30.0,
+        )
         validation = harness.assert_contract(scenario, timeout_sec=60.0)
         return _result_payload(scenario, validation)
     finally:
@@ -345,9 +358,10 @@ def _run_error_correlation(harness: ChaosLabHarness) -> dict[str, object]:
 def _run_restart_continuity(harness: ChaosLabHarness) -> dict[str, object]:
     scenario = harness.prepare_scenario("restart_continuity")
     consumer = harness.start_slow_consumer(scenario, delay_sec=1.0)
+    producer = None
     try:
-        harness.produce_perf(scenario, num_records=2000, throughput=-1)
         harness.pause_consumer_runner()
+        producer = harness.produce_perf_async(scenario, num_records=5000, throughput=20)
         harness.assert_incident(
             scenario,
             lambda incident: incident.get("scope") == "consumer_group"
@@ -364,6 +378,8 @@ def _run_restart_continuity(harness: ChaosLabHarness) -> dict[str, object]:
             harness.unpause_consumer_runner()
         except Exception:
             pass
+        if producer is not None:
+            producer.terminate()
         consumer.terminate()
 
 
@@ -372,7 +388,9 @@ def _run_webhook_redelivery(harness: ChaosLabHarness) -> dict[str, object]:
     consumer = harness.start_slow_consumer(scenario, delay_sec=1.0)
     producer = None
     try:
-        harness.fail_next_webhook_delivery(1)
+        # Exhaust the webhook sink's initial attempt plus its configured retries so the
+        # lifecycle record remains in the persisted failed state until we manually redeliver it.
+        harness.fail_next_webhook_delivery(4)
         producer = harness.produce_perf_async(scenario, num_records=2000, throughput=20)
         harness.assert_incident(
             scenario,

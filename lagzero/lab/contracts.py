@@ -221,6 +221,13 @@ def validate_lifecycle_contract(
     if not logical_groups:
         return ContractSection(False, "No lifecycle events were captured.")
 
+    if scenario_name == "restart_continuity":
+        return _validate_restart_lifecycle_contract(
+            logical_groups=logical_groups,
+            lifecycle_events=lifecycle_events,
+            state_snapshot=state_snapshot,
+        )
+
     opened_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.opened")
     updated_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.updated")
     resolved_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.resolved")
@@ -431,6 +438,75 @@ def _scenario_requires_no_synthetic_update(scenario_name: str) -> bool:
     return scenario_name == "restart_continuity"
 
 
+def _validate_restart_lifecycle_contract(
+    *,
+    logical_groups: dict[str, list[dict[str, object]]],
+    lifecycle_events: list[dict[str, object]],
+    state_snapshot: dict[str, list[dict[str, object]]],
+) -> ContractSection:
+    opened_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.opened")
+    updated_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.updated")
+    resolved_count = sum(1 for event in lifecycle_events if event.get("event_type") == "incident.resolved")
+    incident_ids = {str(event.get("incident_id")) for event in lifecycle_events}
+
+    issues: list[str] = []
+    if opened_count == 0:
+        issues.append("Expected at least one lifecycle open event.")
+    if updated_count > 0:
+        issues.append("Restart continuity scenario emitted an unexpected `incident.updated` after restart.")
+
+    primary_groups = {
+        logical_key: events_for_incident
+        for logical_key, events_for_incident in logical_groups.items()
+        if logical_key.startswith("consumer_group:")
+        and logical_key.endswith(("|pressure", "|stall"))
+    }
+    if not primary_groups:
+        issues.append(
+            "Restart continuity scenario did not retain a consumer-group pressure/stall logical incident."
+        )
+    else:
+        for logical_key, events_for_incident in primary_groups.items():
+            opens = [event for event in events_for_incident if event.get("event_type") == "incident.opened"]
+            resolves = [event for event in events_for_incident if event.get("event_type") == "incident.resolved"]
+            if len(opens) > 1:
+                issues.append(
+                    f"Primary logical incident `{logical_key}` emitted more than one `incident.opened`."
+                )
+            if resolves:
+                issues.append(
+                    f"Primary logical incident `{logical_key}` resolved during the restart continuity scenario."
+                )
+
+    active_primary_rows = [
+        row
+        for row in state_snapshot.get("incidents", [])
+        if row.get("scope") == "consumer_group"
+        and row.get("family") in {"pressure", "stall"}
+        and row.get("status") != "resolved"
+    ]
+    if not active_primary_rows:
+        issues.append(
+            "No unresolved consumer-group pressure/stall incident remained in persisted state after restart."
+        )
+
+    evidence = {
+        "logical_incident_count": len(logical_groups),
+        "logical_incidents": sorted(logical_groups.keys()),
+        "incident_ids": sorted(incident_ids),
+        "opened_count": opened_count,
+        "updated_count": updated_count,
+        "resolved_count": resolved_count,
+        "state_incident_rows": len(state_snapshot.get("incidents", [])),
+        "state_timeline_rows": len(state_snapshot.get("timeline", [])),
+        "active_primary_rows": active_primary_rows,
+        "primary_logical_incidents": sorted(primary_groups.keys()),
+    }
+    if issues:
+        return ContractSection(False, " ".join(issues), evidence)
+    return ContractSection(True, "Lifecycle contract passed.", evidence)
+
+
 def _section(passed: bool, reason: str, final_incident: IncidentPayload | None) -> ContractSection:
     return ContractSection(passed, reason, {"final_incident": final_incident})
 
@@ -467,9 +543,18 @@ def _validate_burst_spike(
     if final_anomaly in RECOVERY_ANOMALIES and final_health in RECOVERY_STATES:
         return _section(True, "Burst ended in an explicit recovery state.", final_incident)
     if final_anomaly in DELAY_ANOMALIES:
-        if final_incident.get("offset_lag", 0) > 0 and _is_near_zero(final_incident.get("producer_rate")):
+        diagnostics = final_incident.get("diagnostics") or {}
+        partitions = diagnostics.get("affected_partitions", [])
+        group_level_quiet = _is_near_zero(final_incident.get("producer_rate"))
+        partition_level_quiet = any(
+            (partition.get("offset_lag", 0) or 0) > 0
+            and _is_near_zero(partition.get("producer_rate"))
+            and partition.get("anomaly") == "idle_but_delayed"
+            for partition in partitions
+        )
+        if final_incident.get("offset_lag", 0) > 0 and (group_level_quiet or partition_level_quiet):
             return _section(True, "Burst ended as `idle_but_delayed` after producer activity stopped with backlog still present.", final_incident)
-        return _section(False, "`idle_but_delayed` requires near-zero producer rate and remaining backlog.", final_incident)
+        return _section(False, "`idle_but_delayed` requires near-zero producer activity visible at group level or on the affected backlog partitions.", final_incident)
     if final_anomaly in SEVERE_ANOMALIES:
         return _section(False, "Burst ended in severe failure instead of recovery, healthy, or justified dark-queue semantics.", final_incident)
     return _section(False, f"Burst final state `{final_anomaly}/{final_health}` is not in an allowed end-state family.", final_incident)

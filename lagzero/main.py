@@ -154,7 +154,7 @@ def run_incidents(argv: list[str]) -> int:
     parser = build_incidents_parser()
     try:
         args = parser.parse_args(argv)
-        settings = Settings.from_env()
+        settings = Settings.from_env(require_monitoring=False)
         configure_logging(settings.log_level)
         _, _, _, history_service = build_incident_runtime(settings)
         if history_service is None:

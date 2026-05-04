@@ -14,6 +14,10 @@ from lagzero.sinks.signing import build_signature
 logger = logging.getLogger(__name__)
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 class WebhookCaptureServer:
     def __init__(
         self,
@@ -29,7 +33,7 @@ class WebhookCaptureServer:
         self._secret = secret
         self._output_path: Path | None = None
         self._fail_remaining = 0
-        self._server = ThreadingHTTPServer((host, port), self._build_handler())
+        self._server = ReusableThreadingHTTPServer((host, port), self._build_handler())
         self._thread: Thread | None = None
 
     @property
